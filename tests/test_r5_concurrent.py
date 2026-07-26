@@ -1,12 +1,11 @@
-"""R5-1 修复验证: reconcile 与 acquire 并发不泄漏沙箱
-之前: reconcile 直接标 RUNNING 为 CLEANED(不 kill), 与 acquire 并发时
-      acquire-finally 跳过 kill → 沙箱留 E2B 泄漏 (实测 2/4 漏)
-现在: reconcile 只清 stale 的 RUNNING(无心跳), 活跃的(有心跳)不碰 → acquire 自己 kill
+"""R3-1/R3-2: 真正触发 acquire-vs-reconcile 竞争 + 钉住 fresh-heartbeat 不被碰
+R3-1 教训: 上版用 time.sleep(0.5) 发 reconcile, 但首行 ~1.3s 才出现 → 碰 0 行 = 假验证。
+本版用事件同步: 等 RUNNING 行存在且心跳新, 再发 reconcile。
 """
 import os, time, threading, logging
 os.environ["E2B_API_KEY"] = "***REMOVED***"
 logging.basicConfig(level=logging.WARNING)
-from managed_e2b import SandboxLifecycle
+from managed_e2b import SandboxLifecycle, State
 from e2b_code_interpreter import Sandbox
 
 passed, failed = [], []
@@ -14,40 +13,57 @@ def check(name, cond, detail=""):
     (passed if cond else failed).append(name)
     print(f"  {'✓' if cond else '✗'} {name} {detail}")
 
-DB = "/root/sb_r5_conc.db"
+DB = "/root/sb_r7_conc.db"
 if os.path.exists(DB): os.remove(DB)
 lc = SandboxLifecycle(db_path=DB, max_concurrent=2, stale_timeout=600)
 
-print("=== R5-1: reconcile 与 acquire 并发, 沙箱必须被 kill 不泄漏 ===")
-leaked = []
-def run_task(i):
-    """acquire 一个沙箱, 期间另一个线程跑 reconcile"""
-    try:
-        with lc.acquire(template="base", timeout=120, metadata={"track": f"c{i}"}) as h:
-            # acquire 持有期间, reconcile 不该碰它(心跳新)
-            time.sleep(2)
-            # 记录 sid 供事后检查是否被 E2B 清掉
-            leaked.append(h.sid)
-    except Exception as e:
-        print(f"  [t{i}] 异常: {e}")
+# R3-2: 钉住 fresh-heartbeat RUNNING 行不被 reconcile 碰
+print("[1] R3-2: reconcile 不碰 fresh-heartbeat 的 RUNNING 行")
+held = {}
+def hold_task():
+    with lc.acquire(template="base", timeout=120, metadata={"track": "hold"}) as h:
+        held["sid"] = h.sid
+        held["event"].set()      # 通知主线程: RUNNING 行已存在
+        time.sleep(3)            # 持有期间让 reconcile 跑
+held["event"] = threading.Event()
+t = threading.Thread(target=hold_task, daemon=True)
+t.start()
+held["event"].wait(30)          # 等 acquire 真正进入 RUNNING
+sid = held["sid"]
+# 此时行是 RUNNING + 心跳新, reconcile 不该碰它
+row_before = lc.db.get(sid)
+r = lc.reconcile()
+row_after = lc.db.get(sid)
+check("reconcile 前状态=running", row_before["state"] == "running")
+check("reconcile 没碰 fresh-heartbeat 行", row_after["state"] == "running",
+      f"(reconciled={r['reconciled']})")
+check("reconcile 没 kill 持有的沙箱", Sandbox.connect(sid).is_running())
+t.join()
 
-threads = [threading.Thread(target=run_task, args=(i,)) for i in range(3)]
-# 同时跑 reconcile(可能和 acquire 并发)
-for t in threads: t.start()
-time.sleep(0.5)
-lc.reconcile()  # 并发跑
-for t in threads: t.join()
+# R3-1: 真竞争 — reconcile 在 acquire 持有期间跑, 退出后沙箱必须被 kill(不泄漏)
+print("\n[2] R3-1: acquire-vs-reconcile 真竞争, 退出后 0 泄漏")
+sids = []
+def task(i, ev):
+    with lc.acquire(template="base", timeout=120, metadata={"track": f"c{i}"}) as h:
+        sids.append(h.sid)
+        ev.set()
+        time.sleep(2)
 
-# 所有沙箱退出 with 后应被 kill。检查它们在 E2B 上是否还活着
-alive_count = 0
-for sid in leaked:
+ev = threading.Event()
+ts = [threading.Thread(target=task, args=(i, ev), daemon=True) for i in range(2)]
+for t in ts: t.start()
+ev.wait(30)  # 等至少一个进入 RUNNING
+lc.reconcile()  # 持有期间并发 reconcile
+for t in ts: t.join()
+
+leaked = 0
+for sid in sids:
     try:
         if Sandbox.connect(sid).is_running():
-            alive_count += 1
+            leaked += 1
     except Exception:
-        pass  # 已死=已清, 不计泄漏
-check("无泄漏(所有沙箱退出后被 kill)", alive_count == 0, f"(leaked alive: {alive_count}/{len(leaked)})")
-check("退出后全 cleaned", lc.db.stats().get("cleaned", 0) == len(leaked))
+        pass
+check("退出后 0 泄漏(全被 kill)", leaked == 0, f"(leaked {leaked}/{len(sids)})")
 
 print(f"\n=== {len(passed)} passed, {len(failed)} failed ===")
 if failed: print("FAILED:", failed)

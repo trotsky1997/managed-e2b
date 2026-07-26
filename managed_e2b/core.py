@@ -159,6 +159,7 @@ class SandboxDB:
                 "WHERE sandbox_id=? AND state != ?",
                 (State.CLEANING.value, int(time.time()), sid, State.CLEANED.value),
             )
+            self._conn.commit()  # R1-1: 显式提交, 防 close/crash 回滚致 CLEANING claim 丢失
             return cur.rowcount > 0
 
     def list_stale_running(self, max_age: int) -> list[sqlite3.Row]:
@@ -334,6 +335,7 @@ class SandboxLifecycle:
         atexit.register(self.shutdown)
         # template 预热: 去重 + 并发 build 锁
         self._template_ready: dict[str, bool] = {}      # name -> 已就绪
+        self._template_alias: dict[str, str] = {}    # canonical -> renamed (R2-3: ERROR 换名后映射)
         self._template_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._inflight: set[str] = set()  # 当前进程持有中的 sandbox_id(#4 shutdown 兜底)
@@ -375,13 +377,14 @@ class SandboxLifecycle:
             raise ValueError("prewarm 需要 image 或 dockerfile")
         name = self.template_name_for(image, dockerfile)
         # 内存级快路径: 本进程已确认就绪, 直接返回 (省一次 exists RPC)
+        # R2-3: 若曾被 rename, 返回 renamed 名(_template_alias), 否则 canonical
         if self._template_ready.get(name):
-            return name
+            return self._template_alias.get(name, name)
         lock = self._template_lock(name)
         with lock:  # 同一 template 的 build 串行, 不同 template 不互斥
             # double-check: 拿到锁后可能已被别的线程 build 好
             if self._template_ready.get(name):
-                return name
+                return self._template_alias.get(name, name)
             from e2b import Template
             # #2 修复(v2): exists() 只查 alias 在不在, 不查 build 成功。
             # build_in_background 是异步的, 单次 get_build_status 必返回 BUILDING(v1 死代码)。
@@ -416,9 +419,10 @@ class SandboxLifecycle:
                     try:
                         self._build_with_timeout(builder, name_to_use, cpu_count, memory_mb)
                         self._template_ready[name_to_use] = True
-                        # R5-2: 规范名也指向已建的 renamed template, 重试同输入时走快路径不重建
+                        # R2-3: canonical 指向 renamed, 快路径返回 renamed 名(而非损坏的 canonical)
                         if name_to_use != name:
-                            self._template_ready[name] = name_to_use
+                            self._template_ready[name] = True
+                            self._template_alias[name] = name_to_use
                         logger.info(f"template {name_to_use} build 完成")
                         return name_to_use
                     except Exception as e:
@@ -494,11 +498,13 @@ class SandboxLifecycle:
         real_id = sbx.sandbox_id
         # 直接用真实 id 落盘 (不要临时 id + rename, 那套在并发下易竞态/漏字段)
         try:
+            now = int(time.time())
             self.db.upsert(
                 real_id,
                 state=State.RUNNING.value,
                 template=template,
-                created_at=int(time.time()),
+                created_at=now,
+                last_heartbeat=now,  # R2-1: 插入即有心跳, 消除 NULL 窗口被 reconcile 误清
                 metadata=str(metadata),
             )
         except Exception as e:
