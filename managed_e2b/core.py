@@ -238,6 +238,7 @@ class SandboxHandle:
     sid: str
     sandbox: object  # e2b_code_interpreter.Sandbox 实例
     template: str
+    lifecycle: "SandboxLifecycle" = None  # 所属 lifecycle (用于状态机/清理); fork/resume 的副本可空
 
     # ---- stage in/out: ephemeral 文件传输 (随沙箱销毁) ----
     def stage_in(self, files: dict, prefix: str = "/task") -> dict:
@@ -308,26 +309,45 @@ class SandboxHandle:
 
     def fork(self, count: int = 1, timeout: int = 60) -> list:
         """复制当前沙箱 (带状态) 为 count 个新沙箱。返回 SandboxHandle 列表。
-        副本不进 me2b 状态机 (非 acquire 路径), 用完需自行 kill 或 h.kill()。"""
+        副本进 me2b 状态机 (写 RUNNING + _inflight), 防 atexit/reap 漏清。用完随 handle 走。"""
         forks = self.sandbox.fork(count=count, timeout=timeout)
         handles = []
+        now = int(time.time())
         for f in forks:
             if isinstance(f, Exception):
                 logger.warning(f"fork 失败: {f}")
                 continue
-            handles.append(SandboxHandle(sid=f.sandbox_id, sandbox=f, template=self.template))
+            h = SandboxHandle(sid=f.sandbox_id, sandbox=f, template=self.template, lifecycle=self.lifecycle)
+            if self.lifecycle:
+                # 进状态机: 标 RUNNING + _inflight, atexit/reap 能清
+                self.lifecycle.db.upsert(f.sandbox_id, state=State.RUNNING.value,
+                                        template=self.template, created_at=now, last_heartbeat=now,
+                                        metadata='{"forked_from":"' + self.sid + '"}')
+                with self.lifecycle._inflight_lock:
+                    self.lifecycle._inflight.add(f.sandbox_id)
+            handles.append(h)
         return handles
 
     def pause(self, keep_memory: bool = True) -> bool:
-        """暂停沙箱 (保内存), 后续 resume 恢复。火山端点可能禁用 pause。"""
-        return self.sandbox.pause(keep_memory=keep_memory)
+        """暂停沙箱 (保内存), 后续 resume 恢复。火山端点可能禁用 pause。
+        状态机: RUNNING→PAUSED (写 sqlite)。"""
+        r = self.sandbox.pause(keep_memory=keep_memory)
+        if r and self.lifecycle:
+            self.lifecycle.db.set_state(self.sid, State.PAUSED)
+        return r
 
     def resume(self, timeout: int = None) -> "SandboxHandle":
         """恢复已暂停的沙箱 (E2B 无独立 resume, 用 connect auto-resume)。
-        返回新的 handle (原沙箱恢复)。"""
+        状态机: PAUSED→RUNNING (写 sqlite + 重启心跳)。返回新 handle。"""
         Sandbox = type(self.sandbox)
         sbx = Sandbox.connect(self.sid, timeout=timeout)
-        return SandboxHandle(sid=self.sid, sandbox=sbx, template=self.template)
+        h = SandboxHandle(sid=self.sid, sandbox=sbx, template=self.template, lifecycle=self.lifecycle)
+        if self.lifecycle:
+            self.lifecycle.db.set_state(self.sid, State.RUNNING)
+            # 重启心跳
+            hb = _Heartbeat(self.lifecycle, self.sid, self.lifecycle._stale_timeout)
+            hb.start()
+        return h
 
 
 class _Heartbeat:
@@ -596,7 +616,7 @@ class SandboxLifecycle:
             except Exception:
                 pass
             raise
-        return SandboxHandle(sid=real_id, sandbox=sbx, template=template)
+        return SandboxHandle(sid=real_id, sandbox=sbx, template=template, lifecycle=self)
 
     # ---- graceful kill + clean (核心: 用 is_running 确认, 不信 list) ----
     def _kill_one(self, sid: str, sandbox_obj: object = None, force: bool = False) -> bool:

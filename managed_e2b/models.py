@@ -26,6 +26,7 @@ class State(str, Enum):
     READY = "ready"
     CREATING = "creating"
     RUNNING = "running"
+    PAUSED = "paused"
     GRACEFUL_QUIT = "graceful_quit"
     TIMEOUT = "timeout"
     CLEANING = "cleaning"
@@ -52,7 +53,8 @@ _TRANSITIONS: dict[State, frozenset] = {
     State.PREWARMING: frozenset({State.READY, State.PREWARM_FAIL}),
     State.READY: frozenset({State.CREATING, State.PREWARM_FAIL}),
     State.CREATING: frozenset({State.RUNNING, State.CREATE_FAIL}),
-    State.RUNNING: frozenset({State.GRACEFUL_QUIT, State.TIMEOUT, State.CLEANING}),
+    State.RUNNING: frozenset({State.PAUSED, State.GRACEFUL_QUIT, State.TIMEOUT, State.CLEANING}),
+    State.PAUSED: frozenset({State.RUNNING, State.CLEANING}),  # resume→RUNNING, kill→CLEANING
     State.GRACEFUL_QUIT: frozenset({State.CLEANING}),
     State.TIMEOUT: frozenset({State.CLEANING}),
     State.CLEANING: frozenset({State.CLEANED, State.CLEANING}),  # 可重入(崩溃残留重试)
