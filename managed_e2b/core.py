@@ -299,6 +299,36 @@ class SandboxHandle:
         self.run('echo ' + repr(cred) + ' | sudo tee /etc/passwd-s3fs >/dev/null; sudo chmod 600 /etc/passwd-s3fs; sudo mkdir -p ' + mount_point, timeout=30)
         self.run(f"sudo /usr/bin/s3fs {bucket} {mount_point} -o url=https://tos-s3-cn-beijing.volces.com -o endpoint={region} -o passwd_file=/etc/passwd-s3fs -o allow_other", timeout=30)
 
+    # ---- 保存/复制/暂停 (snapshot/fork/pause) ----
+    def save(self, name: str = None) -> str:
+        """保存当前沙箱状态为快照 (持久, 跨沙箱可恢复)。返回 snapshot id。"""
+        info = self.sandbox.create_snapshot(name=name)
+        sid = getattr(info, "id", None) or getattr(info, "snapshot_id", None)
+        return sid
+
+    def fork(self, count: int = 1, timeout: int = 60) -> list:
+        """复制当前沙箱 (带状态) 为 count 个新沙箱。返回 SandboxHandle 列表。
+        副本不进 me2b 状态机 (非 acquire 路径), 用完需自行 kill 或 h.kill()。"""
+        forks = self.sandbox.fork(count=count, timeout=timeout)
+        handles = []
+        for f in forks:
+            if isinstance(f, Exception):
+                logger.warning(f"fork 失败: {f}")
+                continue
+            handles.append(SandboxHandle(sid=f.sandbox_id, sandbox=f, template=self.template))
+        return handles
+
+    def pause(self, keep_memory: bool = True) -> bool:
+        """暂停沙箱 (保内存), 后续 resume 恢复。火山端点可能禁用 pause。"""
+        return self.sandbox.pause(keep_memory=keep_memory)
+
+    def resume(self, timeout: int = None) -> "SandboxHandle":
+        """恢复已暂停的沙箱 (E2B 无独立 resume, 用 connect auto-resume)。
+        返回新的 handle (原沙箱恢复)。"""
+        Sandbox = type(self.sandbox)
+        sbx = Sandbox.connect(self.sid, timeout=timeout)
+        return SandboxHandle(sid=self.sid, sandbox=sbx, template=self.template)
+
 
 class _Heartbeat:
     """后台心跳线程: 定期刷新沙箱的 last_heartbeat, 证明它仍被活跃持有。
@@ -696,6 +726,37 @@ class SandboxLifecycle:
                 self._kill_one(h.sid, h.sandbox)
                 with self._inflight_lock:
                     self._inflight.discard(h.sid)
+
+    # ---- 从快照/暂停恢复 ----
+    @contextmanager
+    def restore_from_snapshot(self, snapshot_id: str, timeout: int = 300,
+                              metadata: Optional[dict] = None):
+        """从快照起一个新沙箱 (E2B: Sandbox.create(template=snapshot_id))。
+        带完整生命周期: 进 RUNNING、心跳、退出 kill + 清理。
+        snapshot_id 由 h.save(name=) 返回。"""
+        md = metadata or {}
+        md.setdefault("managed_by", "sandbox_lifecycle")
+        md["restored_from"] = snapshot_id
+        with self._create_limiter.slot():
+            h = self._create(snapshot_id, timeout, md)
+        with self._inflight_lock:
+            self._inflight.add(h.sid)
+        hb = _Heartbeat(self, h.sid, self._stale_timeout)
+        hb.start()
+        try:
+            with self._run_limiter.slot():
+                yield h
+        finally:
+            if h is not None:
+                self._kill_one(h.sid, h.sandbox)
+                with self._inflight_lock:
+                    self._inflight.discard(h.sid)
+
+    def resume_sandbox(self, sid: str) -> SandboxHandle:
+        """恢复一个已暂停的沙箱 (connect auto-resume)。返回 handle (不进状态机, 用完自管)。"""
+        Sandbox = self._sandbox_cls()
+        sbx = Sandbox.connect(sid)
+        return SandboxHandle(sid=sid, sandbox=sbx, template="(resumed)")
 
     # ---- 启动时对账: 清崩溃残留 (#5) ----
     def reconcile(self) -> dict:
