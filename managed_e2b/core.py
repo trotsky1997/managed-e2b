@@ -235,6 +235,66 @@ class SandboxHandle:
     sandbox: object  # e2b_code_interpreter.Sandbox 实例
     template: str
 
+    # ---- stage in/out: ephemeral 文件传输 (随沙箱销毁) ----
+    def stage_in(self, files: dict, prefix: str = "/task") -> dict:
+        """stage in: 把文件推进沙箱 (ephemeral)。
+        files: {相对路径: content} 或 {绝对路径: content}
+        prefix: 相对路径的根 (默认 /task)
+        返回 {原路径: 沙箱内绝对路径}
+        """
+        paths = {}
+        for name, content in files.items():
+            dst = name if name.startswith("/") else f"{prefix}/{name}"
+            parent = "/".join(dst.split("/")[:-1]) or "/"
+            self.sandbox.files.make_dir(parent)
+            self.sandbox.files.write(dst, content)
+            paths[name] = dst
+        return paths
+
+    def stage_out(self, paths, prefix: str = "/task") -> dict:
+        """stage out: 从沙箱取文件 (ephemeral)。返回 {路径: bytes}"""
+        out = {}
+        for p in paths:
+            src = p if p.startswith("/") else f"{prefix}/{p}"
+            out[p] = self.sandbox.files.read(src, format="bytes")
+        return out
+
+    def run_script(self, script: str, args: list = None, interpreter: str = None,
+                   workdir: str = "/task", timeout: int = 60, env: dict = None) -> dict:
+        """执行 stage in 推入的脚本。自动定位 + 推断解释器。
+        返回 {stdout, stderr, exit_code}
+        """
+        path = script if script.startswith("/") else f"{workdir}/{script}"
+        if interpreter is None:
+            ext = path.rsplit(".", 1)[-1] if "." in path else "sh"
+            interpreter = {".py": "python3", "py": "python3", ".js": "node", "js": "node",
+                           ".sh": "bash", "sh": "bash"}.get(ext if ext.startswith(".") else "." + ext, "bash")
+        cmd = f"{interpreter} {path}"
+        if args:
+            cmd += " " + " ".join(str(a) if " " not in str(a) else repr(str(a)) for a in args)
+        if env:
+            cmd = " ".join(f"{k}={v}" for k, v in env.items()) + " " + cmd
+        r = self.sandbox.commands.run(f"cd {workdir} && {cmd}", timeout=timeout)
+        return {"stdout": r.stdout or "", "stderr": r.stderr or "", "exit_code": r.exit_code}
+
+    def run(self, command: str, timeout: int = 60) -> dict:
+        """执行任意命令 (raw)。返回 {stdout, stderr, exit_code}"""
+        r = self.sandbox.commands.run(command, timeout=timeout)
+        return {"stdout": r.stdout or "", "stderr": r.stderr or "", "exit_code": r.exit_code}
+
+    def mount_tos(self, bucket: str, mount_point: str = "/mnt/tos", region: str = "cn-beijing"):
+        """挂载火山 TOS 桶为本地目录 (s3fs FUSE, virtual-host style)。
+        需 E2B_TOS_AK / E2B_TOS_SK 环境变量。大文件/跨沙箱共享数据用。
+        """
+        ak = os.environ.get("E2B_TOS_AK") or os.environ.get("TOS_ACCESS_KEY")
+        sk = os.environ.get("E2B_TOS_SK") or os.environ.get("TOS_SECRET_KEY")
+        if not ak or not sk:
+            raise RuntimeError("mount_tos 需 E2B_TOS_AK/E2B_TOS_SK 环境变量")
+        self.run("sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq s3fs >/dev/null 2>&1", timeout=180)
+        cred = f"{ak}:{sk}"
+        self.run('echo ' + repr(cred) + ' | sudo tee /etc/passwd-s3fs >/dev/null; sudo chmod 600 /etc/passwd-s3fs; sudo mkdir -p ' + mount_point, timeout=30)
+        self.run(f"sudo /usr/bin/s3fs {bucket} {mount_point} -o url=https://tos-s3-cn-beijing.volces.com -o endpoint={region} -o passwd_file=/etc/passwd-s3fs -o allow_other", timeout=30)
+
 
 class _Heartbeat:
     """后台心跳线程: 定期刷新沙箱的 last_heartbeat, 证明它仍被活跃持有。
