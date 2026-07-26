@@ -44,6 +44,16 @@ from .config import E2BConfig, load_env, get_e2b_config
 
 __version__ = "0.1.0"
 
+# async 支持 (懒加载: 不在 import 时拉 asyncio/e2b, sync-only 调用方不受影响)
+def __getattr__(name):
+    if name == "AsyncSandboxLifecycle":
+        from .async_core import AsyncSandboxLifecycle
+        return AsyncSandboxLifecycle
+    if name == "AsyncSandboxHandle":
+        from .async_core import AsyncSandboxHandle
+        return AsyncSandboxHandle
+    raise AttributeError(f"module 'managed_e2b' has no attribute {name!r}")
+
 __all__ = [
     # core
     "SandboxLifecycle",
@@ -67,4 +77,7 @@ __all__ = [
     "E2BConfig",
     "load_env",
     "get_e2b_config",
+    # async (懒加载)
+    "AsyncSandboxLifecycle",
+    "AsyncSandboxHandle",
 ]
