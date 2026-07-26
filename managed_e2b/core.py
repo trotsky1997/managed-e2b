@@ -140,13 +140,14 @@ class SandboxDB:
         """原子抢占 kill 所有权: 若状态非 CLEANED 则改成 CLEANING 并返回 True;
         已 CLEANED 则改 0 行返回 False。消除 get+set 间的竞态(状态倒退)。"""
         with self._lock:
-            # 只排除 CLEANED(已清终态)。CLEANING 允许重入: 崩溃残留的 CLEANING 行
-            # (kill 到一半) 需要 reap 重入完成 kill。并发重复 kill 幂等(kill 返回 False),
-            # 不致命; 真正要防的是 CLEANED→CLEANING 状态倒退(已死被当活)。
+            # 状态机校验 + CAS 原子性合一: 只允许 RUNNING→CLEANING 和 CLEANING→CLEANING
+            # (崩溃残留重入)。拒绝 CLEANED→CLEANING 倒退(已死被当活)和其他非法转移。
+            # 等价于 State.can_transition_to(CLEANING) 的 SQL 编码。
             cur = self._conn.execute(
                 "UPDATE sandboxes SET state=?, killed_at=? "
-                "WHERE sandbox_id=? AND state != ?",
-                (State.CLEANING.value, int(time.time()), sid, State.CLEANED.value),
+                "WHERE sandbox_id=? AND state IN (?, ?)",
+                (State.CLEANING.value, int(time.time()), sid,
+                 State.RUNNING.value, State.CLEANING.value),
             )
             self._conn.commit()  # R1-1: 显式提交, 防 close/crash 回滚致 CLEANING claim 丢失
             return cur.rowcount > 0
@@ -488,14 +489,11 @@ class SandboxLifecycle:
         # 直接用真实 id 落盘 (不要临时 id + rename, 那套在并发下易竞态/漏字段)
         try:
             now = int(time.time())
-            self.db.upsert(
-                real_id,
-                state=State.RUNNING.value,
-                template=template,
-                created_at=now,
-                last_heartbeat=now,  # R2-1: 插入即有心跳, 消除 NULL 窗口被 reconcile 误清
-                metadata=str(metadata),
-            )
+            # 用 SandboxRecord 校验字段一致性(时间戳/类型), 再序列化落盘
+            rec = SandboxRecord(sandbox_id=real_id, state=State.RUNNING,
+                                template=template, created_at=now,
+                                last_heartbeat=now, metadata=str(metadata))
+            self.db.upsert(real_id, **rec.to_db_row())
         except Exception as e:
             # db 写失败但沙箱已建 → 必须 kill, 否则真孤儿
             logger.error(f"db 写入失败, 回收沙箱 {real_id}: {e}")
@@ -533,9 +531,11 @@ class SandboxLifecycle:
         confirmed_dead = self._confirm_dead(sid, sandbox_obj)
         if confirmed_dead:
             if force:
-                # 外部 sid 不在 DB: 补全 NOT NULL 字段后落盘 CLEANED
-                self.db.upsert(sid, state=State.CLEANED.value, template="(foreign)",
-                               created_at=int(time.time()), killed_at=int(time.time()))
+                # 外部 sid 不在 DB: 用 SandboxRecord 校验后落盘 CLEANED
+                now = int(time.time())
+                rec = SandboxRecord(sandbox_id=sid, state=State.CLEANED,
+                                    template="(foreign)", created_at=now, killed_at=now)
+                self.db.upsert(sid, **rec.to_db_row())
             else:
                 self.db.set_state(sid, State.CLEANED)
         else:
