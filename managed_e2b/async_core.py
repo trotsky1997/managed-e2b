@@ -185,6 +185,15 @@ class AsyncSandboxLifecycle:
         Sandbox = self._sandbox_cls()
         return await Sandbox.connect(sid)
 
+    async def _next_items(self, pg, timeout: int = 10):
+        """版本无关地取 paginator 下一页。e2b 2.34 的 AsyncSandboxPaginator.next_items
+        是协程(该 await);2.35 返回同步 SandboxPaginator, next_items 返回 list(不该 await)。
+        运行时检测: 协程就 await+wait_for, 否则直接返回(同步 list)。"""
+        ni = pg.next_items()
+        if asyncio.iscoroutine(ni):
+            return await asyncio.wait_for(ni, timeout=timeout)
+        return ni
+
     # ---- create ----
     async def _create(self, template: str, timeout: int, metadata: dict,
                       allow_internet_access: bool = True, network: dict = None) -> AsyncSandboxHandle:
@@ -503,7 +512,7 @@ class AsyncSandboxLifecycle:
                     break
                 result["iters"] += 1
                 try:
-                    batch = await asyncio.wait_for(pg.next_items(), timeout=10)
+                    batch = await self._next_items(pg, timeout=10)
                 except asyncio.TimeoutError:
                     logger.warning("reap next_items 超时, 跳过本轮")
                     break
@@ -540,7 +549,7 @@ class AsyncSandboxLifecycle:
                 limit=self._reaper_list_limit)
             for _ in range(self._reaper_max_iter):
                 try:
-                    items = await asyncio.wait_for(pg.next_items(), timeout=10)
+                    items = await self._next_items(pg, timeout=10)
                 except (asyncio.TimeoutError, Exception):
                     result["list_failed"] = True
                     logger.warning("reconcile list 失败, 跳过清理")
