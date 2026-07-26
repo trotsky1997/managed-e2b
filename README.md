@@ -64,6 +64,32 @@ lc.acquire(template="base", metadata={"k": 1})  # ValidationError: metadata must
 
 `with`-exit auto-kills + confirms dead. `atexit` reaps anything still alive when the process exits.
 
+## Use with evalscope
+
+`managed_e2b_evalscope.py` is a drop-in backend that runs evalscope's code
+execution (humaneval/mbpp/…) in E2B sandboxes managed by me2b, instead of the
+local docker sandbox.
+
+```python
+import os
+os.environ["E2B_API_KEY"] = "e2b_..."
+
+import managed_e2b_evalscope as m2b_ev
+m2b_ev.install_e2b_backend(template="base", e2b_key=os.environ["E2B_API_KEY"])
+
+from evalscope import run_task, TaskConfig
+cfg = TaskConfig(
+    model="your-model", api_url="https://api.example.com/v1",
+    api_key="...", eval_type="openai_api",
+    datasets=["humaneval"], limit=10,
+    sandbox={"enabled": True, "engine": "docker"},  # engine value ignored once E2B takes over
+)
+run_task(task_cfg=cfg)  # generated code runs in E2B, results match the local-docker path
+```
+
+Verified: glm-5.2 on 10 HumanEval problems scores pass@1 = 1.0 via the E2B
+backend, identical to the local-docker path.
+
 ## Configuration
 
 | param | default | meaning |
