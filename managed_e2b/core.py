@@ -621,11 +621,14 @@ class SandboxLifecycle:
                 "note": "E2B SDK 无 template 删除 API, 需控制台清理"}
 
     # ---- create ----
-    def _create(self, template: str, timeout: int, metadata: dict) -> SandboxHandle:
+    def _create(self, template: str, timeout: int, metadata: dict,
+                allow_internet_access: bool = True, network: dict = None) -> SandboxHandle:
         """create 沙箱并落盘。关键: 先 create 拿到真实 id, 再写 db;
-        若 create 成功但写 db 失败, 仍要 kill 沙箱避免孤儿(见 acquire 的 except)。"""
+        若 create 成功但写 db 失败, 仍要 kill 沙箱避免孤儿(见 acquire 的 except)。
+        allow_internet_access/network 透传给 E2B create (控制沙箱网络)。"""
         Sandbox = self._sandbox_cls()
-        sbx = Sandbox.create(template=template, timeout=timeout, metadata=metadata)
+        sbx = Sandbox.create(template=template, timeout=timeout, metadata=metadata,
+                             allow_internet_access=allow_internet_access, network=network)
         real_id = sbx.sandbox_id
         # 直接用真实 id 落盘 (不要临时 id + rename, 那套在并发下易竞态/漏字段)
         try:
@@ -720,7 +723,8 @@ class SandboxLifecycle:
     @contextmanager
     def acquire(self, image: Optional[str] = None, dockerfile: Optional[str] = None,
                 template: Optional[str] = None, timeout: int = 1800,  # #6: 默认1800s(评测常>5min); E2B到点自动kill
-                metadata: Optional[dict] = None):
+                metadata: Optional[dict] = None,
+                allow_internet_access: bool = True, network: dict = None):
         # ⚠️ timeout 是硬上限(#1 文档化): create(timeout=) 到点 E2B 自动 kill 沙箱 (on_timeout=kill)。
         # 本状态机不在心跳里 set_timeout 续命 (保持简单)。调用方必须传一个超过最坏任务时长的值,
         # 否则长任务会被 E2B 在执行中途 kill。默认 300s 只够短任务。
@@ -740,7 +744,8 @@ class SandboxLifecycle:
         """
         # pydantic 校验: image/dockerfile/template 三选一, timeout 有界, metadata 强类型
         req = AcquireRequest(image=image, dockerfile=dockerfile, template=template,
-                             timeout=timeout, metadata=metadata or {})
+                             timeout=timeout, metadata=metadata or {},
+                             allow_internet_access=allow_internet_access, network=network)
         image, dockerfile, template, timeout = req.image, req.dockerfile, req.template, req.timeout
         if not image and not dockerfile and not template:
             template = "base"
@@ -755,7 +760,7 @@ class SandboxLifecycle:
         # finally 都能拿到 h 并清理, 杜绝"create 成功但 h 未赋值就中断"的泄漏。
         try:
             with self._create_limiter.slot():
-                h = self._create(template, timeout, md)
+                h = self._create(template, timeout, md, req.allow_internet_access, req.network)
             with self._inflight_lock:
                 self._inflight.add(h.sid)
             # 心跳: 后台线程定期刷新 last_heartbeat, 证明沙箱仍被本进程活跃持有。
@@ -812,6 +817,15 @@ class SandboxLifecycle:
         with self._inflight_lock:
             self._inflight.add(sid)
         return SandboxHandle(sid=sid, sandbox=sbx, template="(resumed)", lifecycle=self)
+
+    def _release(self, handle: SandboxHandle) -> None:
+        """释放一个 handle (kill + db clean + 移出 _inflight)。
+        供非 context-manager 场景 (如 Harbor stop) 用, 对应 acquire 的 finally。"""
+        if handle is None:
+            return
+        self._kill_one(handle.sid, handle.sandbox)
+        with self._inflight_lock:
+            self._inflight.discard(handle.sid)
 
     # ---- 快照清理: 删自己追踪的快照 (防 E2B 侧累积) ----
     def cleanup_snapshots(self, keep: set = None) -> dict:

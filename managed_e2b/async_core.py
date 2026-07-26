@@ -186,10 +186,13 @@ class AsyncSandboxLifecycle:
         return await Sandbox.connect(sid)
 
     # ---- create ----
-    async def _create(self, template: str, timeout: int, metadata: dict) -> AsyncSandboxHandle:
-        """create 沙箱并落盘。先 create 拿真实 id (必须 await), 再写 db。"""
+    async def _create(self, template: str, timeout: int, metadata: dict,
+                      allow_internet_access: bool = True, network: dict = None) -> AsyncSandboxHandle:
+        """create 沙箱并落盘。先 create 拿真实 id (必须 await), 再写 db。
+        allow_internet_access/network 透传给 E2B create (控制沙箱网络)。"""
         Sandbox = self._sandbox_cls()
-        sbx = await Sandbox.create(template=template, timeout=timeout, metadata=metadata)
+        sbx = await Sandbox.create(template=template, timeout=timeout, metadata=metadata,
+                                   allow_internet_access=allow_internet_access, network=network)
         real_id = sbx.sandbox_id
         try:
             now = int(time.time())
@@ -358,10 +361,13 @@ class AsyncSandboxLifecycle:
     # ---- acquire ----
     @asynccontextmanager
     async def acquire(self, image: str = None, dockerfile: str = None,
-                      template: str = None, timeout: int = 1800, metadata: dict = None):
-        """获取沙箱, 用完自动 kill + clean。带 limiter + 心跳。"""
+                      template: str = None, timeout: int = 1800, metadata: dict = None,
+                      allow_internet_access: bool = True, network: dict = None):
+        """获取沙箱, 用完自动 kill + clean。带 limiter + 心跳。
+        allow_internet_access/network 透传给 E2B create (控制沙箱网络)。"""
         req = AcquireRequest(image=image, dockerfile=dockerfile, template=template,
-                             timeout=timeout, metadata=metadata or {})
+                             timeout=timeout, metadata=metadata or {},
+                             allow_internet_access=allow_internet_access, network=network)
         image, dockerfile, template, timeout = req.image, req.dockerfile, req.template, req.timeout
         if not image and not dockerfile and not template:
             template = "base"
@@ -373,7 +379,7 @@ class AsyncSandboxLifecycle:
             template = await self.prewarm(image=image, dockerfile=dockerfile)
         try:
             async with self._create_limiter.slot():
-                h = await self._create(template, timeout, md)
+                h = await self._create(template, timeout, md, req.allow_internet_access, req.network)
             self._inflight.add(h.sid)
             hb = AsyncHeartbeat(self, h.sid, self._stale_timeout)
             hb.start()
@@ -435,6 +441,14 @@ class AsyncSandboxLifecycle:
         if hb._task:
             self._hb_tasks.add(hb._task)
         return h
+
+    async def _release(self, handle: AsyncSandboxHandle) -> None:
+        """释放一个 handle (kill + db clean + 移出 _inflight)。
+        供非 context-manager 场景 (如 Harbor stop) 用, 对应 acquire 的 finally。"""
+        if handle is None:
+            return
+        await asyncio.shield(self._kill_one(handle.sid, handle.sandbox))
+        self._inflight.discard(handle.sid)
 
     # ---- snapshot cleanup ----
     async def cleanup_snapshots(self, keep: set = None) -> dict:

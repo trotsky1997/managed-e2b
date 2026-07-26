@@ -155,6 +155,8 @@ class AcquireRequest(BaseModel):
     template: Optional[str] = Field(None, description="现成 template 名 (不 build)")
     timeout: int = Field(1800, gt=0, le=86400, description="E2B 硬超时(秒); E2B 拒>86400")
     metadata: dict[str, str] = Field(default_factory=dict, description="E2B metadata (str→str)")
+    allow_internet_access: bool = Field(True, description="是否允许沙箱访问互联网")
+    network: Optional[dict] = Field(None, description="网络策略 (E2B SandboxNetworkOpts, dict 子类) {allow_out, deny_out}")
 
     @field_validator("image", "dockerfile", "template")
     @classmethod
