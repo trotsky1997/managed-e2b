@@ -11,15 +11,60 @@ Quick start:
     with lc.acquire(template="base", timeout=300) as h:
         h.sandbox.commands.run("echo hello")
     # with-exit auto kills + cleans; atexit reaps any stragglers.
+
+Stage in/out + script execution + TOS mount:
+    with lc.acquire(template="base") as h:
+        h.stage_in({"solve.py": code})
+        r = h.run_script("solve.py")
+        out = h.stage_out(["result.txt"])
+        h.mount_tos("my-bucket")  # needs E2B_TOS_AK/SK env
 """
 from .core import (
     SandboxLifecycle,
     SandboxHandle,
-    State,
     SandboxDB,
     Limiter,
     RateLimiter,
 )
+from .models import (
+    State,
+    SandboxRecord,
+    SandboxConfig,
+    AcquireRequest,
+)
+from .errors import (
+    Me2bError,
+    StateTransitionError,
+    SandboxLeakError,
+    PrewarmError,
+    ConfigError,
+    TosError,
+)
+from .config import E2BConfig, load_env, get_e2b_config
 
 __version__ = "0.1.0"
-__all__ = ["SandboxLifecycle", "SandboxHandle", "State", "SandboxDB", "Limiter", "RateLimiter"]
+
+__all__ = [
+    # core
+    "SandboxLifecycle",
+    "SandboxHandle",
+    "SandboxDB",
+    "Limiter",
+    "RateLimiter",
+    # models
+    "State",
+    "SandboxRecord",
+    "SandboxConfig",
+    "AcquireRequest",
+    # errors
+    "Me2bError",
+    "StateTransitionError",
+    "SandboxLeakError",
+    "PrewarmError",
+    "ConfigError",
+    "TosError",
+    # config
+    "E2BConfig",
+    "load_env",
+    "get_e2b_config",
+]

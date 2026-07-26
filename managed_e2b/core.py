@@ -35,6 +35,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from managed_e2b.models import State, SandboxRecord, SandboxConfig, AcquireRequest
+from managed_e2b.errors import (
+    Me2bError, StateTransitionError, SandboxLeakError,
+    PrewarmError, ConfigError, TosError,
+)
 from typing import Optional
 
 logger = logging.getLogger("sandbox_lifecycle")
@@ -113,7 +117,7 @@ class SandboxDB:
         if row is not None:
             cur = State(row["state"])
             if not cur.can_transition_to(state):
-                raise ValueError(f"非法状态转移: {cur.value} → {state.value} (sid={sid})")
+                raise StateTransitionError(f"非法状态转移: {cur.value} → {state.value} (sid={sid})")
         extra = {}
         if state == State.RUNNING:
             now = int(time.time())
@@ -289,7 +293,7 @@ class SandboxHandle:
         ak = os.environ.get("E2B_TOS_AK") or os.environ.get("TOS_ACCESS_KEY")
         sk = os.environ.get("E2B_TOS_SK") or os.environ.get("TOS_SECRET_KEY")
         if not ak or not sk:
-            raise RuntimeError("mount_tos 需 E2B_TOS_AK/E2B_TOS_SK 环境变量")
+            raise TosError("mount_tos 需 E2B_TOS_AK/E2B_TOS_SK 环境变量")
         self.run("sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq s3fs >/dev/null 2>&1", timeout=180)
         cred = f"{ak}:{sk}"
         self.run('echo ' + repr(cred) + ' | sudo tee /etc/passwd-s3fs >/dev/null; sudo chmod 600 /etc/passwd-s3fs; sudo mkdir -p ' + mount_point, timeout=30)
@@ -375,7 +379,7 @@ class SandboxLifecycle:
         self._run_limiter = Limiter(max_concurrent)  # 同时 RUNNING 的沙箱
         self._key = e2b_key or os.environ.get("E2B_API_KEY")
         if not self._key:
-            raise RuntimeError("E2B_API_KEY 未设置")
+            raise ConfigError("E2B_API_KEY 未设置")
         self.reaper_max_iter = reaper_max_iter
         self.reaper_list_limit = reaper_list_limit
         self._stale_timeout = stale_timeout  # 已由 SandboxConfig 校验 >=10
@@ -424,7 +428,7 @@ class SandboxLifecycle:
         返回 template 名, 供 _create 用。
         """
         if not image and not dockerfile:
-            raise ValueError("prewarm 需要 image 或 dockerfile")
+            raise ConfigError("prewarm 需要 image 或 dockerfile")
         name = self.template_name_for(image, dockerfile)
         # 内存级快路径: 本进程已确认就绪, 直接返回 (省一次 exists RPC)
         # R2-3: 若曾被 rename, 返回 renamed 名(_template_alias), 否则 canonical
@@ -478,7 +482,7 @@ class SandboxLifecycle:
                     except Exception as e:
                         last_err = e
                         logger.warning(f"template {name_to_use} build 第{attempt+1}次失败: {e}")
-                raise RuntimeError(f"prewarm build {name_to_use} 失败: {last_err}") from last_err
+                raise PrewarmError(f"prewarm build {name_to_use} 失败: {last_err}") from last_err
 
     def _poll_template_status(self, Template, builder, name: str, timeout: int = 300) -> str:
         """轮询 template build 到终态(ready/error)。build_in_background 复用同 name 的 build。"""
@@ -520,7 +524,7 @@ class SandboxLifecycle:
             if "success" in s or "ready" in s:
                 return
             if "error" in s or "fail" in s:
-                raise RuntimeError(f"template {name} build 失败: {s}")
+                raise PrewarmError(f"template {name} build 失败: {s}")
             time.sleep(3)
         raise TimeoutError(f"template {name} build 超时 ({timeout}s)")
 

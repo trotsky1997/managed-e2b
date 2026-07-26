@@ -14,13 +14,20 @@ keywords = ["e2b", "sandbox", "lifecycle", "code-execution", "orphan"]
 dependencies = [
     "e2b>=2.30",
     "e2b-code-interpreter>=2.4",
+    "pydantic>=2.5",
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
+tos = ["tos>=2.5"]          # 火山 TOS SDK (mount_tos 的 boto3/s3fs 走沙箱内)
+tos-sdk = ["tos>=2.5"]
+s3 = ["boto3>=1.30"]       # 沙箱内 boto3 访问 TOS S3 兼容端
 
 [project.urls]
 Homepage = "https://github.com/trotsky1997/managed-e2b"
 
 [tool.setuptools.packages.find]
 include = ["managed_e2b*"]
+
+[tool.setuptools.package-data]
+managed_e2b = ["py.typed"]

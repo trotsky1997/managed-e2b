@@ -8,3 +8,4 @@ dist/
 .eggs/
 .tox/
 .pytest_cache/
+.env
