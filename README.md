@@ -64,6 +64,51 @@ lc.acquire(template="base", metadata={"k": 1})  # ValidationError: metadata must
 
 `with`-exit auto-kills + confirms dead. `atexit` reaps anything still alive when the process exits.
 
+### Stage in/out + script execution
+
+```python
+with lc.acquire(template="base", timeout=300) as h:
+    h.stage_in({"solve.py": code, "input.json": data})   # push files into sandbox
+    r = h.run_script("solve.py", args=["--input", "input.json"])  # auto python3/node/bash
+    out = h.stage_out(["result.json"])                    # pull files out
+    # h.run("echo raw")                                   # raw command
+```
+
+### Save / fork / pause (persistence)
+
+```python
+with lc.acquire(template="base") as h:
+    h.stage_in({"state.bin": data})
+    snap = h.save("checkpoint-1")          # snapshot (persistent, tracked in sqlite)
+    clones = h.fork(count=4)               # clone 4 sandboxes with state (tracked, cleaned on exit)
+    h.pause(keep_memory=True)              # pause; resume() via connect (auto-resume)
+
+# restore from snapshot (full lifecycle: RUNNING/heartbeat/kill/clean)
+with lc.restore_from_snapshot(snap) as h:
+    h.run_script("solve.py")
+
+# resume a paused sandbox (tracked, atexit-cleaned)
+h = lc.resume_sandbox(sid)
+
+# clean up tracked snapshots (prevent E2B-side accumulation)
+lc.cleanup_snapshots(keep={snap})
+```
+
+### TOS mount (large files / shared data)
+
+Mount a Volcengine TOS bucket as a local dir inside the sandbox (s3fs FUSE,
+virtual-host style) — large files go through the mount, not the upload API:
+
+```python
+os.environ["E2B_TOS_AK"] = "AKLT..."   # no trailing =
+os.environ["E2B_TOS_SK"] = "..."        # base64, used as-is
+with lc.acquire(template="base") as h:
+    h.mount_tos("my-bucket")             # → /mnt/tos
+    h.run("cat /mnt/tos/dataset.jsonl")  # read TOS object like a local file
+```
+
+Credentials can also go in a `.env` file (see `.env.example`); `load_env()` reads it.
+
 ## Use with evalscope
 
 `managed_e2b_evalscope.py` is a drop-in backend that runs evalscope's code
@@ -110,7 +155,7 @@ backend, identical to the local-docker path.
 - `AcquireRequest` — `acquire()` params: image/dockerfile/template mutual exclusion, `0 < timeout <= 86400`, `dict[str,str]` metadata.
 - `State` — enum + transition graph; illegal jumps (e.g. `RUNNING → CLEANED`) are rejected.
 
-**State machine** (sqlite-tracked, **enforced on every write path**): `RUNNING → CLEANING → CLEANED`. The transition guard is encoded into the `try_claim_for_kill` CAS (`WHERE state IN (RUNNING, CLEANING)`) so a `CLEANED → CLEANING` reversal is rejected atomically — you can't bypass the state machine by going around `set_state`. Pre-warm/build states are transient (not persisted); failure raises.
+**State machine** (sqlite-tracked, **enforced on every write path**): `RUNNING → CLEANING → CLEANED`, plus `RUNNING ↔ PAUSED`. The transition guard is encoded into the `try_claim_for_kill` CAS (`WHERE state IN (RUNNING, CLEANING)`) so a `CLEANED → CLEANING` reversal is rejected atomically — you can't bypass the state machine by going around `set_state`. All sandbox-producing methods (`acquire`/`restore_from_snapshot`/`fork`/`resume`/`resume_sandbox`) enter the state machine: they write RUNNING + join `_inflight`, so atexit/shutdown/reap can clean them — no orphan leak from forks or resumed sandboxes. Snapshots are tracked in a separate `snapshots` table (source sandbox, created time) and cleaned via `cleanup_snapshots()`.
 
 **Three independent concurrency limits** — different resources, not one shared lock:
 - `build` — template builds (don't consume sandbox quota)
@@ -129,7 +174,8 @@ backend, identical to the local-docker path.
 - **Template cleanup**: E2B SDK 2.x exposes no `Template.list`/`Template.remove`. Templates built by me2b accumulate on your account; reuse is deduped by content hash, but distinct images produce distinct templates. Clean up via the E2B console.
 - **Crash recovery** requires reusing the same `db_path` across runs; a fresh db_path can't see prior orphans (use `reconcile()` on startup against a stable db).
 - **Long tasks**: `timeout=` is a *hard ceiling* — E2B auto-kills at expiry. Pass a value exceeding your worst-case task duration (default 1800s).
+- **`pause` endpoint support**: works on the official E2B endpoint; the Volcengine-hosted mirror rejects `pause` (`function not allowed to be paused`). `snapshot`/`fork` work on both.
 
 ## Status
 
-Pre-1.0. The lifecycle core is review-hardened (7 rounds, ~38 issues fixed) with a pydantic v2 model layer and a strict state machine enforced on every write path. 17 test suites / 109 tests. Tests require a live E2B account (`E2B_API_KEY`) and create real sandboxes.
+Pre-1.0. The lifecycle core is review-hardened (7 rounds, ~38 issues fixed) with a pydantic v2 model layer, a strict state machine enforced on every write path (incl. fork/resume/snapshot), stage in/out + script execution, TOS mount, and typed errors. 20 test suites / 104 tests. Tests require a live E2B account (`E2B_API_KEY`) and create real sandboxes.
