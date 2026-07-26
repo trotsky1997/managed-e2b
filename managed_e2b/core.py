@@ -800,10 +800,18 @@ class SandboxLifecycle:
                     self._inflight.discard(h.sid)
 
     def resume_sandbox(self, sid: str) -> SandboxHandle:
-        """恢复一个已暂停的沙箱 (connect auto-resume)。返回 handle (不进状态机, 用完自管)。"""
+        """恢复一个已暂停的沙箱 (connect auto-resume)。纳入状态机:
+        标 RUNNING + 进 _inflight, atexit/shutdown 兜底清理。
+        注意: 若该沙箱已在 sqlite (me2b 创建过), 会刷新其状态; 若是外部沙箱, 新建一行。"""
         Sandbox = self._sandbox_cls()
         sbx = Sandbox.connect(sid)
-        return SandboxHandle(sid=sid, sandbox=sbx, template="(resumed)")
+        now = int(time.time())
+        # 状态机: 标 RUNNING + 心跳 (upsert 幂等: 已存在则更新, 不存在则新建)
+        self.db.upsert(sid, state=State.RUNNING.value, template="(resumed)",
+                       created_at=now, last_heartbeat=now)
+        with self._inflight_lock:
+            self._inflight.add(sid)
+        return SandboxHandle(sid=sid, sandbox=sbx, template="(resumed)", lifecycle=self)
 
     # ---- 快照清理: 删自己追踪的快照 (防 E2B 侧累积) ----
     def cleanup_snapshots(self, keep: set = None) -> dict:
