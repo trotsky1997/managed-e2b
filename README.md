@@ -1,6 +1,6 @@
 # managed-e2b (me2b)
 
-A **state-machine + sqlite-tracked lifecycle manager for [E2B](https://e2b.dev) sandboxes** that prevents orphaned sandboxes.
+A **state-machine + sqlite-tracked lifecycle manager for [E2B](https://e2b.dev) sandboxes** that prevents orphaned sandboxes. **Sync and async** — same API, same guarantees.
 
 ```
 queue/limiter → prewarm (build template if needed, dedup) → create → running (heartbeat) → graceful quit/timeout → clean
@@ -135,6 +135,36 @@ run_task(task_cfg=cfg)  # generated code runs in E2B, results match the local-do
 Verified: glm-5.2 on 10 HumanEval problems scores pass@1 = 1.0 via the E2B
 backend, identical to the local-docker path.
 
+## Async
+
+me2b has a native async API (`AsyncSandboxLifecycle` / `AsyncSandboxHandle`)
+mirroring the sync one — same state machine, heartbeat, orphan reaping, and
+lifecycle semantics. Sandboxes run on `AsyncSandbox` (true `await`); sqlite
+calls go through `asyncio.to_thread`; the heartbeat is an `asyncio.create_task`
+(no thread). Sync and async share `models`/`errors`/`config`/`SandboxDB`.
+
+```python
+import asyncio
+from managed_e2b import AsyncSandboxLifecycle
+
+async def main():
+    lc = AsyncSandboxLifecycle(db_path="me2b.db", max_concurrent=4)
+    async with lc.acquire(template="base", timeout=300) as h:
+        await h.stage_in({"solve.py": code})
+        r = await h.run_script("solve.py")
+        out = await h.stage_out(["result.txt"])
+    # fan out many sandboxes concurrently
+    await asyncio.gather(*[run_one(lc, i) for i in range(10)])
+    await lc.shutdown()
+
+asyncio.run(main())
+```
+
+`acquire` / `restore_from_snapshot` are `@asynccontextmanager`; `reap` /
+`reconcile` / `shutdown` / `save` / `fork` / `pause` / `resume` are all
+`async def`. The sync API (`SandboxLifecycle`) is unchanged — import what you
+need; async classes load lazily and don't pull `asyncio` at sync import time.
+
 ## Configuration
 
 | param | default | meaning |
@@ -178,4 +208,4 @@ backend, identical to the local-docker path.
 
 ## Status
 
-Pre-1.0. The lifecycle core is review-hardened (7 rounds, ~38 issues fixed) with a pydantic v2 model layer, a strict state machine enforced on every write path (incl. fork/resume/snapshot), stage in/out + script execution, TOS mount, and typed errors. 20 test suites / 104 tests. Tests require a live E2B account (`E2B_API_KEY`) and create real sandboxes.
+Pre-1.0. The lifecycle core is review-hardened (7 rounds, ~38 issues fixed) with a pydantic v2 model layer, a strict state machine enforced on every write path (incl. fork/resume/snapshot), stage in/out + script execution, TOS mount, typed errors, and **native async** (sync + async share the state machine). 23 test suites / 116 tests. Tests require a live E2B account (`E2B_API_KEY`) and create real sandboxes.
