@@ -34,7 +34,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from managed_e2b.models import State, SandboxRecord, SandboxConfig
+from managed_e2b.models import State, SandboxRecord, SandboxConfig, AcquireRequest
 from typing import Optional
 
 logger = logging.getLogger("sandbox_lifecycle")
@@ -597,9 +597,13 @@ class SandboxLifecycle:
         - template: 直接用现成 template 名 (如 "base"), 不 build。
         全不传则用 "base"。
         """
+        # pydantic 校验: image/dockerfile/template 三选一, timeout 有界, metadata 强类型
+        req = AcquireRequest(image=image, dockerfile=dockerfile, template=template,
+                             timeout=timeout, metadata=metadata or {})
+        image, dockerfile, template, timeout = req.image, req.dockerfile, req.template, req.timeout
         if not image and not dockerfile and not template:
             template = "base"
-        md = metadata or {}
+        md = dict(req.metadata)
         md.setdefault("managed_by", "sandbox_lifecycle")
 
         h: Optional[SandboxHandle] = None

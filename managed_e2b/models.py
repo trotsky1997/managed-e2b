@@ -141,3 +141,31 @@ class SandboxConfig(BaseModel):
         """stale_timeout 必须 >= 10 (心跳间隔要 < 它), 已由 Field ge=10 保证;
         这里额外确保 build_timeout 合理。"""
         return self
+
+
+class AcquireRequest(BaseModel):
+    """acquire() 参数校验模型: image/dockerfile/template 三选一, timeout 有界, metadata 强类型。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: Optional[str] = Field(None, description="Docker 镜像 url (走 prewarm build)")
+    dockerfile: Optional[str] = Field(None, description="Dockerfile 内容 (走 prewarm build)")
+    template: Optional[str] = Field(None, description="现成 template 名 (不 build)")
+    timeout: int = Field(1800, gt=0, le=86400, description="E2B 硬超时(秒); E2B 拒>86400")
+    metadata: dict[str, str] = Field(default_factory=dict, description="E2B metadata (str→str)")
+
+    @field_validator("image", "dockerfile", "template")
+    @classmethod
+    def _nonempty(cls, v: Optional[str]) -> Optional[str]:
+        """空字符串视为未传(避免 prewarm 收到空 image)。"""
+        if v is not None and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "AcquireRequest":
+        """image/dockerfile/template 三选一; 全空则用默认 template='base' (由调用方填)。"""
+        provided = [x for x in (self.image, self.dockerfile, self.template) if x]
+        if len(provided) > 1:
+            raise ValueError("image/dockerfile/template 三选一, 不能同时传多个")
+        return self
