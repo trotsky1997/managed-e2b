@@ -12,8 +12,8 @@ requires-python = ">=3.9"
 authors = [{ name = "trotsky1997" }]
 keywords = ["e2b", "sandbox", "lifecycle", "code-execution", "orphan"]
 dependencies = [
-    "e2b>=2.30",
-    "e2b-code-interpreter>=2.4",
+    "e2b>=2.34,<3",
+    "e2b-code-interpreter>=2.6,<3",
     "pydantic>=2.5",
 ]
 
