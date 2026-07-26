@@ -297,7 +297,9 @@ class SandboxLifecycle:
         reaper_max_iter: int = 5,
         reaper_list_limit: int = 100,
         # RUNNING 态判孤儿的心跳超时: 超过此值无心跳 = 持有进程已崩溃。
-        # 默认 600s = 2× E2B 默认 timeout(300), 留足余量。
+        # 默认 600s。注意: stale_timeout 只管 reap 检测延迟(无心跳多久判孤儿),
+        # 不 bound orphan bill —— E2B 在 create(timeout=) 到点杀沙箱(默认 1800s)。
+        # 建议 stale_timeout 设为评测任务时长的 1/3, 让 reap 及时清崩溃残留。
         stale_timeout: int = 600,
         # 三种并发数独立控制 (不同资源, 不同约束):
         max_build_concurrency: int = 4,    # template build 并发 (E2B ~20, 留余量)
@@ -430,7 +432,8 @@ class SandboxLifecycle:
         try:
             info = Template.build_in_background(builder, name)
         except Exception as e:
-            # 已 READY 的 alias 上 build_in_background 可能抛 400 -> 视为 ready
+            # 防御: 2.34.0 上 build_in_background 对已存在 alias 返回 202+BuildInfo 不抛;
+            # 若未来版本抛 400("already"/"not in waiting"), 视为已 ready。
             msg = str(e).lower()
             if "ready" in msg or "not in waiting" in msg or "already" in msg:
                 return "ready"
@@ -774,6 +777,9 @@ class SandboxLifecycle:
             inflight = list(self._inflight)
         for sid in inflight:
             self._kill_one(sid, force=True)
+        # R5-3: 清空 _inflight, 防重入 shutdown 重复对已 CLEANED 的 sid 发 RPC
+        with self._inflight_lock:
+            self._inflight.clear()
         for row in self.db.list_state(State.CLEANING):
             self._kill_one(row["sandbox_id"])
         for row in self.db.list_stale_running(self._stale_timeout):
