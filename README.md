@@ -14,10 +14,20 @@ Built and hardened through **7 rounds of multi-agent adversarial review** (doc-i
 
 ## Install
 
+Not on PyPI — install from GitHub:
+
 ```bash
-pip install managed-e2b
+pip install git+https://github.com/trotsky1997/managed-e2b.git
 # requires e2b + e2b-code-interpreter; set your key:
 export E2B_API_KEY=e2b_...
+```
+
+Or clone and develop:
+
+```bash
+git clone https://github.com/trotsky1997/managed-e2b.git
+cd managed-e2b
+pip install -e .
 ```
 
 ## Usage
