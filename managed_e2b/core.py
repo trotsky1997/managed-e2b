@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     last_heartbeat INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_state ON sandboxes(state);
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id   TEXT PRIMARY KEY,
+    name          TEXT,
+    source_sid    TEXT,
+    created_at    INTEGER NOT NULL
+);
 """
 
 # schema 迁移: 旧 db 没有 last_heartbeat 列时补上
@@ -185,6 +191,24 @@ class SandboxDB:
             rows = self._conn.execute("SELECT state, COUNT(*) n FROM sandboxes GROUP BY state").fetchall()
             return {r["state"]: r["n"] for r in rows}
 
+    # ---- snapshot 追踪 (持久资源, 单独表) ----
+    def record_snapshot(self, snapshot_id: str, name: str = None, source_sid: str = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO snapshots (snapshot_id, name, source_sid, created_at) VALUES (?,?,?,?)",
+                (snapshot_id, name, source_sid, int(time.time())),
+            )
+            self._conn.commit()
+
+    def list_snapshots(self) -> list:
+        with self._lock:
+            return self._conn.execute("SELECT * FROM snapshots").fetchall()
+
+    def forget_snapshot(self, snapshot_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM snapshots WHERE snapshot_id=?", (snapshot_id,))
+            self._conn.commit()
+
     def close(self):
         with self._lock:
             self._conn.close()
@@ -302,10 +326,13 @@ class SandboxHandle:
 
     # ---- 保存/复制/暂停 (snapshot/fork/pause) ----
     def save(self, name: str = None) -> str:
-        """保存当前沙箱状态为快照 (持久, 跨沙箱可恢复)。返回 snapshot id。"""
+        """保存当前沙箱状态为快照 (持久, 跨沙箱可恢复)。返回 snapshot id。
+        快照记入 sqlite (snapshots 表), 防 E2B 侧无限累积; cleanup_snapshots() 可清。"""
         info = self.sandbox.create_snapshot(name=name)
-        sid = getattr(info, "id", None) or getattr(info, "snapshot_id", None)
-        return sid
+        snap_id = getattr(info, "id", None) or getattr(info, "snapshot_id", None)
+        if snap_id and self.lifecycle:
+            self.lifecycle.db.record_snapshot(snap_id, name=name, source_sid=self.sid)
+        return snap_id
 
     def fork(self, count: int = 1, timeout: int = 60) -> list:
         """复制当前沙箱 (带状态) 为 count 个新沙箱。返回 SandboxHandle 列表。
@@ -777,6 +804,26 @@ class SandboxLifecycle:
         Sandbox = self._sandbox_cls()
         sbx = Sandbox.connect(sid)
         return SandboxHandle(sid=sid, sandbox=sbx, template="(resumed)")
+
+    # ---- 快照清理: 删自己追踪的快照 (防 E2B 侧累积) ----
+    def cleanup_snapshots(self, keep: set = None) -> dict:
+        """删除 sqlite 追踪的快照 (E2B delete_snapshot + sqlite forget)。
+        keep: 保留的 snapshot_id 集合。返回 {deleted, failed}。"""
+        Sandbox = self._sandbox_cls()
+        keep = keep or set()
+        result = {"deleted": 0, "failed": 0}
+        for row in self.db.list_snapshots():
+            sid = row["snapshot_id"]
+            if sid in keep:
+                continue
+            try:
+                Sandbox.delete_snapshot(sid)
+                self.db.forget_snapshot(sid)
+                result["deleted"] += 1
+            except Exception as e:
+                logger.warning(f"删快照 {sid} 失败: {e}")
+                result["failed"] += 1
+        return result
 
     # ---- 启动时对账: 清崩溃残留 (#5) ----
     def reconcile(self) -> dict:
