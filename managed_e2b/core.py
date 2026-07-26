@@ -34,28 +34,10 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from managed_e2b.models import State, SandboxRecord, SandboxConfig
 from typing import Optional
 
 logger = logging.getLogger("sandbox_lifecycle")
-
-
-class State(str, Enum):
-    QUEUED = "queued"
-    PREWARMING = "prewarming"
-    READY = "ready"
-    CREATING = "creating"
-    RUNNING = "running"
-    GRACEFUL_QUIT = "graceful_quit"
-    TIMEOUT = "timeout"
-    CLEANING = "cleaning"
-    CLEANED = "cleaned"
-    PREWARM_FAIL = "prewarm_fail"
-    CREATE_FAIL = "create_fail"
-
-    # 是否为终态
-    @property
-    def terminal(self) -> bool:
-        return self in (State.CLEANED, State.PREWARM_FAIL, State.CREATE_FAIL)
 
 
 # ---------------- sqlite 真相源 ----------------
@@ -125,11 +107,18 @@ class SandboxDB:
                 c.execute(f"INSERT INTO sandboxes ({cols}) VALUES ({ph})", fields)
 
     def set_state(self, sid: str, state: State, error: Optional[str] = None) -> None:
+        """带状态机校验的状态转移: 非法转移(如 RUNNING→CLEANED 跳跃)抛 ValueError。
+        状态副作用(running_since/last_heartbeat/killed_at)集中管理, 与 transition_to 一致。"""
+        row = self.get(sid)
+        if row is not None:
+            cur = State(row["state"])
+            if not cur.can_transition_to(state):
+                raise ValueError(f"非法状态转移: {cur.value} → {state.value} (sid={sid})")
         extra = {}
         if state == State.RUNNING:
             now = int(time.time())
             extra["running_since"] = now
-            extra["last_heartbeat"] = now  # 进 RUNNING 时初始化心跳
+            extra["last_heartbeat"] = now
         if state in (State.CLEANING, State.GRACEFUL_QUIT, State.TIMEOUT):
             extra["killed_at"] = int(time.time())
         if error is not None:
@@ -308,12 +297,14 @@ class SandboxLifecycle:
         # max_concurrent 控制同时 RUNNING 的沙箱数 (评测并发度, 用户主控)
         e2b_api_url: Optional[str] = None,  # E2B 端点; 不传则用环境变量/官方默认
     ):
+        # pydantic 校验层: 参数集中校验 (ge/gt/stale>=10), 替代手写 raise
+        cfg = SandboxConfig(db_path=db_path, max_concurrent=max_concurrent,
+                            create_rate=create_rate, max_build_concurrency=max_build_concurrency,
+                            stale_timeout=stale_timeout, reaper_max_iter=reaper_max_iter,
+                            reaper_list_limit=reaper_list_limit, e2b_key=e2b_key, e2b_api_url=e2b_api_url)
         # 端点 + key 都下沉到 env (SDK 每次调用读 os.getenv):
-        # 显式传入 > 环境变量 > SDK 默认。火山方舟环境必须设, 否则连错端点/key。
         if e2b_api_url:
             os.environ["E2B_API_URL"] = e2b_api_url
-        # e2b_key 也必须下沉 env: SDK 从 os.getenv("E2B_API_KEY") 读, self._key 不传给任何调用。
-        # 否则 "key 只走构造参数、不预置 env" 会 AuthenticationException。
         if e2b_key:
             os.environ["E2B_API_KEY"] = e2b_key
         self.db = SandboxDB(db_path)
@@ -326,9 +317,7 @@ class SandboxLifecycle:
             raise RuntimeError("E2B_API_KEY 未设置")
         self.reaper_max_iter = reaper_max_iter
         self.reaper_list_limit = reaper_list_limit
-        if stale_timeout < 10:
-            raise ValueError(f"stale_timeout={stale_timeout} 太小: 心跳 interval 会接近/超过它导致活跃沙箱被误杀(#4). 至少 10s")
-        self._stale_timeout = stale_timeout
+        self._stale_timeout = stale_timeout  # 已由 SandboxConfig 校验 >=10
         self._reaper_lock = threading.Lock()
         # atexit 必须在构造时注册: 只用 acquire 不调 reap 的进程
         # 退出时也要清理 RUNNING 沙箱, 否则就是"孤儿进程危机"复现。
@@ -678,14 +667,15 @@ class SandboxLifecycle:
         # 改为只清 stale 的 RUNNING(像 reap, 无心跳=崩溃残留, E2B已timeout杀, 标CLEANED即可);
         # 活跃的(心跳新)不碰, 由 acquire finally 自己 kill。
         # CLEANING 态(kill到一半的残留)直接标 CLEANED(E2B已杀)。
+        # 走完整状态机(_kill_one): try_claim→CLEANING→confirm死→CLEANED。
+        # 严格校验后不能直接 RUNNING→CLEANED 跳跃; _kill_one 对崩溃残留(E2B已杀)
+        # 的 confirm 会判已死→CLEANED, 对活沙箱(不该出现, stale才进)会 kill。
         for row in self.db.list_stale_running(self._stale_timeout):
-            sid = row["sandbox_id"]
-            self.db.set_state(sid, State.CLEANED)
-            result["reconciled"] += 1
+            if self._kill_one(row["sandbox_id"]):
+                result["reconciled"] += 1
         for row in self.db.list_state(State.CLEANING):
-            sid = row["sandbox_id"]
-            self.db.set_state(sid, State.CLEANED)
-            result["reconciled"] += 1
+            if self._kill_one(row["sandbox_id"]):
+                result["reconciled"] += 1
         return result
 
     # ---- 孤儿巡检 (保守: 只清自己 sqlite 追踪的超时/僵尸) ----
