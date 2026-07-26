@@ -83,7 +83,7 @@ check("reap reported reaped_own=0 (active heartbeat)", all(r["reaped_own"]==0 fo
 
 # ---- [3] pagination bug check: foreign discovery only sees page 1 ----
 print("\n[3] reaper pagination: pg recreated each iter => only page 1 seen")
-import inspect, sandbox_lifecycle
+import inspect, managed_e2b as sandbox_lifecycle
 src = inspect.getsource(sandbox_lifecycle.SandboxLifecycle.reap)
 loop_block = src[src.index("for _it in range"):src.index("return result")]
 pg_assigns_in_loop = loop_block.count("pg = Sandbox.list")

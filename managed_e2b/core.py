@@ -389,7 +389,8 @@ class SandboxLifecycle:
             name_to_use = name
 
             with self._build_limiter.slot():
-                if self._template_ready.get(name_to_use):
+                ready3 = self._template_ready.get(name_to_use)
+                if ready3:
                     return name_to_use
                 alias_exists = False
                 try:
@@ -413,6 +414,9 @@ class SandboxLifecycle:
                     try:
                         self._build_with_timeout(builder, name_to_use, cpu_count, memory_mb)
                         self._template_ready[name_to_use] = True
+                        # R5-2: 规范名也指向已建的 renamed template, 重试同输入时走快路径不重建
+                        if name_to_use != name:
+                            self._template_ready[name] = name_to_use
                         logger.info(f"template {name_to_use} build 完成")
                         return name_to_use
                     except Exception as e:
@@ -657,12 +661,19 @@ class SandboxLifecycle:
             result["list_failed"] = True
             logger.warning(f"reconcile list 异常, 跳过: {e}")
             return result
-        for state in (State.RUNNING, State.CLEANING):
-            for row in self.db.list_state(state):
-                sid = row["sandbox_id"]
-                if sid not in live:
-                    self.db.set_state(sid, State.CLEANED)
-                    result["reconciled"] += 1
+        # R5-1 修复: 不对"sqlite有E2B无"的 RUNNING 直接标 CLEANED(不kill) ——
+        # 那会与并发 acquire 竞态: acquire-finally 见行已CLEANED跳过kill → 沙箱留E2B泄漏。
+        # 改为只清 stale 的 RUNNING(像 reap, 无心跳=崩溃残留, E2B已timeout杀, 标CLEANED即可);
+        # 活跃的(心跳新)不碰, 由 acquire finally 自己 kill。
+        # CLEANING 态(kill到一半的残留)直接标 CLEANED(E2B已杀)。
+        for row in self.db.list_stale_running(self._stale_timeout):
+            sid = row["sandbox_id"]
+            self.db.set_state(sid, State.CLEANED)
+            result["reconciled"] += 1
+        for row in self.db.list_state(State.CLEANING):
+            sid = row["sandbox_id"]
+            self.db.set_state(sid, State.CLEANED)
+            result["reconciled"] += 1
         return result
 
     # ---- 孤儿巡检 (保守: 只清自己 sqlite 追踪的超时/僵尸) ----
