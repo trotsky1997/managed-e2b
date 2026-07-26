@@ -576,7 +576,10 @@ class SandboxLifecycle:
                 en = type(e).__name__
                 msg = str(e).lower()
                 # 沙箱不存在类异常 → 已死
-                if "notfound" in en.lower() or "not found" in msg or "sandboxnotfound" in en.lower():
+                # R2-2: 也认 400: Invalid sandbox ID (格式无效/从未存在的 id, 如崩溃残留的 fake-id)
+                if ("notfound" in en.lower() or "not found" in msg
+                        or "sandboxnotfound" in en.lower()
+                        or "invalid sandbox id" in msg or "400" in msg and "invalid" in msg):
                     return True
                 # 网络/超时/5xx → 不确定, 重试
                 logger.warning(f"_confirm_dead {sid} 瞬时错误(重试): {en}: {str(e)[:80]}")
