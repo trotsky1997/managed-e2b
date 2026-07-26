@@ -387,7 +387,12 @@ class AsyncSandboxLifecycle:
                 if hb._task:
                     self._hb_tasks.discard(hb._task)
             if h is not None:
-                await asyncio.shield(self._kill_one(h.sid, h.sandbox))
+                # 持 task 引用 + 超时, 防 shield detached/GC/卡死 (审查 A4-2)
+                kill_t = asyncio.create_task(self._kill_one(h.sid, h.sandbox))
+                try:
+                    await asyncio.wait_for(asyncio.shield(kill_t), timeout=120)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    logger.warning(f"acquire kill {h.sid} 超时/取消, 后台继续")
                 self._inflight.discard(h.sid)
 
     # ---- restore from snapshot ----
@@ -410,7 +415,11 @@ class AsyncSandboxLifecycle:
             await hb.stop()
             if hb._task:
                 self._hb_tasks.discard(hb._task)
-            await asyncio.shield(self._kill_one(h.sid, h.sandbox))
+            kill_t = asyncio.create_task(self._kill_one(h.sid, h.sandbox))
+            try:
+                await asyncio.wait_for(asyncio.shield(kill_t), timeout=120)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning(f"restore kill {h.sid} 超时/取消, 后台继续")
             self._inflight.discard(h.sid)
 
     async def resume_sandbox(self, sid: str) -> AsyncSandboxHandle:
@@ -470,8 +479,8 @@ class AsyncSandboxLifecycle:
             from e2b.sandbox.sandbox_api import SandboxQuery
             from e2b.api.client.models.sandbox_state import SandboxState
             try:
-                pg = await Sandbox.list(query=SandboxQuery(state=[SandboxState.RUNNING, SandboxState.PAUSED]),
-                                        limit=self._reaper_list_limit)
+                pg = Sandbox.list(query=SandboxQuery(state=[SandboxState.RUNNING, SandboxState.PAUSED]),
+                                   limit=self._reaper_list_limit)
             except Exception as e:
                 logger.warning(f"reap list 失败: {e}")
                 pg = None
@@ -511,7 +520,7 @@ class AsyncSandboxLifecycle:
         Sandbox = self._sandbox_cls()
         live = set()
         try:
-            pg = await Sandbox.list(query=__import__("e2b.sandbox.sandbox_api", fromlist=["SandboxQuery"]).SandboxQuery(
+            pg = Sandbox.list(query=__import__("e2b.sandbox.sandbox_api", fromlist=["SandboxQuery"]).SandboxQuery(
                 state=[__import__("e2b.api.client.models.sandbox_state", fromlist=["SandboxState"]).SandboxState.RUNNING,
                        __import__("e2b.api.client.models.sandbox_state", fromlist=["SandboxState"]).SandboxState.PAUSED]),
                 limit=self._reaper_list_limit)
