@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "managed-e2b"
+version = "0.1.0"
+description = "Managed E2B sandbox lifecycle: state machine + sqlite tracking, orphan-safe."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "trotsky1997" }]
+keywords = ["e2b", "sandbox", "lifecycle", "code-execution", "orphan"]
+dependencies = [
+    "e2b>=2.30",
+    "e2b-code-interpreter>=2.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/trotsky1997/managed-e2b"
+
+[tool.setuptools.packages.find]
+include = ["managed_e2b*"]
