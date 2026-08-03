@@ -145,7 +145,7 @@ class AsyncSandboxHandle:
         return f"{scheme}://{host}"
 
     async def expose_port(self, port: int, command: str = None, allow_public: bool = True):
-        """暴露沙箱端口供外部访问。
+        """暴露沙箱端口供外部访问。记录到 sqlite (生命周期追踪)。
 
         Args:
             port: 沙箱内端口号
@@ -167,13 +167,58 @@ class AsyncSandboxHandle:
             except Exception as e:
                 logger.warning(f"update_network failed (non-fatal): {e}")
         host = self.sandbox.get_host(port)
-        return PortForward(
+        pf = PortForward(
             port=port,
             host=host,
             url=f"https://{host}",
             command=command,
             sandbox_id=self.sid,
         )
+        # 落盘: 端口转发生命周期追踪
+        if self.lifecycle:
+            await asyncio.to_thread(
+                self.lifecycle.db.record_port_forward,
+                self.sid, port, host, pf.url, command,
+            )
+        return pf
+
+    async def list_ports(self) -> list:
+        """列出当前沙箱已暴露的端口 (从 sqlite 查)。返回 PortForward 列表。"""
+        from managed_e2b.models import PortForward
+        if not self.lifecycle:
+            return []
+        rows = await asyncio.to_thread(self.lifecycle.db.list_port_forwards, self.sid)
+        return [PortForward(
+            port=r["port"], host=r["host"], url=r["url"],
+            command=r["command"], sandbox_id=r["sandbox_id"],
+        ) for r in rows]
+
+    async def close_port(self, port: int) -> bool:
+        """关闭沙箱端口: kill 进程 + 删 sqlite 记录。"""
+        if not self.lifecycle:
+            return False
+        rows = await asyncio.to_thread(self.lifecycle.db.list_port_forwards, self.sid)
+        found = any(r["port"] == port for r in rows)
+        if not found:
+            return False
+        try:
+            await self.sandbox.commands.run(
+                f"sh -c 'fuser -k {port}/tcp 2>/dev/null; pkill -f :{port} 2>/dev/null; true'",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"close_port kill process on {port} failed (non-fatal): {e}")
+        await asyncio.to_thread(self._delete_port_forward, self.sid, port)
+        return True
+
+    def _delete_port_forward(self, sandbox_id: str, port: int):
+        """同步删 sqlite 记录 (供 to_thread 调用)。"""
+        with self.lifecycle.db._lock:
+            self.lifecycle.db._conn.execute(
+                "DELETE FROM port_forwards WHERE sandbox_id=? AND port=?",
+                (sandbox_id, port),
+            )
+            self.lifecycle.db._conn.commit()
 
 
 class AsyncSandboxLifecycle:
@@ -284,6 +329,8 @@ class AsyncSandboxLifecycle:
                 await asyncio.to_thread(self.db.upsert, sid, **rec.to_db_row())
             else:
                 await asyncio.to_thread(self.db.set_state, sid, State.CLEANED)
+                # 清理该沙箱的端口转发记录
+                await asyncio.to_thread(self.db.delete_port_forwards, sid)
         else:
             logger.warning(f"kill {sid} 后 is_running 仍 True, 留 CLEANING 待重试")
         return confirmed

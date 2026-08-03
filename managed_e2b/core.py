@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
     source_sid    TEXT,
     created_at    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS port_forwards (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sandbox_id    TEXT NOT NULL,
+    port          INTEGER NOT NULL,
+    host          TEXT NOT NULL,
+    url           TEXT NOT NULL,
+    command       TEXT,
+    created_at    INTEGER NOT NULL,
+    FOREIGN KEY (sandbox_id) REFERENCES sandboxes(sandbox_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pf_sandbox ON port_forwards(sandbox_id);
 """
 
 # schema 迁移: 旧 db 没有 last_heartbeat 列时补上
@@ -208,6 +219,36 @@ class SandboxDB:
         with self._lock:
             self._conn.execute("DELETE FROM snapshots WHERE snapshot_id=?", (snapshot_id,))
             self._conn.commit()
+
+    # ---- 端口转发追踪 ----
+    def record_port_forward(self, sandbox_id: str, port: int, host: str, url: str,
+                           command: str = None) -> int:
+        """记录一条端口转发, 返回自增 id。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO port_forwards (sandbox_id, port, host, url, command, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (sandbox_id, port, host, url, command, int(time.time())),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def list_port_forwards(self, sandbox_id: str) -> list:
+        """返回某沙箱的所有端口转发记录。"""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM port_forwards WHERE sandbox_id=? ORDER BY port",
+                (sandbox_id,),
+            ).fetchall()
+
+    def delete_port_forwards(self, sandbox_id: str) -> int:
+        """删除某沙箱的所有端口转发记录, 返回删除行数。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM port_forwards WHERE sandbox_id=?", (sandbox_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def close(self):
         with self._lock:
@@ -388,7 +429,7 @@ class SandboxHandle:
         return f"{scheme}://{self.get_host(port)}"
 
     def expose_port(self, port: int, command: str = None, allow_public: bool = True):
-        """暴露沙箱端口供外部访问。
+        """暴露沙箱端口供外部访问。记录到 sqlite (生命周期追踪)。
 
         Args:
             port: 沙箱内端口号
@@ -410,13 +451,54 @@ class SandboxHandle:
             except Exception as e:
                 logger.warning(f"update_network failed (non-fatal): {e}")
         host = self.get_host(port)
-        return PortForward(
+        pf = PortForward(
             port=port,
             host=host,
             url=f"https://{host}",
             command=command,
             sandbox_id=self.sid,
         )
+        # 落盘: 端口转发生命周期追踪 (随沙箱销毁自动失效, 记录用于审计/查询)
+        if self.lifecycle:
+            self.lifecycle.db.record_port_forward(self.sid, port, host, pf.url, command)
+        return pf
+
+    def list_ports(self) -> list:
+        """列出当前沙箱已暴露的端口 (从 sqlite 查)。返回 PortForward 列表。"""
+        from managed_e2b.models import PortForward
+        if not self.lifecycle:
+            return []
+        rows = self.lifecycle.db.list_port_forwards(self.sid)
+        return [PortForward(
+            port=r["port"], host=r["host"], url=r["url"],
+            command=r["command"], sandbox_id=r["sandbox_id"],
+        ) for r in rows]
+
+    def close_port(self, port: int) -> bool:
+        """关闭沙箱端口: kill 沙箱内监听该端口的进程 + 删除 sqlite 记录。
+        返回是否找到并关闭了记录。"""
+        if not self.lifecycle:
+            return False
+        rows = self.lifecycle.db.list_port_forwards(self.sid)
+        found = any(r["port"] == port for r in rows)
+        if not found:
+            return False
+        # kill 沙箱内监听该端口的进程 (best-effort, 失败不阻塞)
+        try:
+            self.sandbox.commands.run(
+                f"sh -c 'fuser -k {port}/tcp 2>/dev/null; pkill -f :{port} 2>/dev/null; true'",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"close_port kill process on {port} failed (non-fatal): {e}")
+        # 删 sqlite 记录
+        with self.lifecycle.db._lock:
+            self.lifecycle.db._conn.execute(
+                "DELETE FROM port_forwards WHERE sandbox_id=? AND port=?",
+                (self.sid, port),
+            )
+            self.lifecycle.db._conn.commit()
+        return True
 
 
 class _Heartbeat:
@@ -724,6 +806,8 @@ class SandboxLifecycle:
                 self.db.upsert(sid, **rec.to_db_row())
             else:
                 self.db.set_state(sid, State.CLEANED)
+                # 清理该沙箱的端口转发记录 (沙箱已死, 端口自然失效)
+                self.db.delete_port_forwards(sid)
         else:
             # 没死透: 保留 CLEANING 状态, 下轮 reap 重试(不标 CLEANED, 防假清)
             logger.warning(f"kill {sid} 后 is_running 仍 True, 留 CLEANING 待重试")
