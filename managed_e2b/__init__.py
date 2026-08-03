@@ -31,6 +31,7 @@ from .models import (
     SandboxRecord,
     SandboxConfig,
     AcquireRequest,
+    PortForward,
 )
 from .errors import (
     Me2bError,
@@ -66,6 +67,7 @@ __all__ = [
     "SandboxRecord",
     "SandboxConfig",
     "AcquireRequest",
+    "PortForward",
     # errors
     "Me2bError",
     "StateTransitionError",

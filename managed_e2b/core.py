@@ -376,6 +376,48 @@ class SandboxHandle:
             hb.start()
         return h
 
+    # ---- 端口转发: 获取沙箱端口的外部访问地址 ----
+    def get_host(self, port: int) -> str:
+        """获取沙箱端口的外部访问主机地址 (host:port 格式)。
+        用此地址可从沙箱外部通过 HTTP/WebSocket 连接到沙箱内端口。"""
+        return self.sandbox.get_host(port)
+
+    def get_url(self, port: int, scheme: str = "https") -> str:
+        """获取沙箱端口的外部访问完整 URL。
+        scheme: http 或 https (默认 https)"""
+        return f"{scheme}://{self.get_host(port)}"
+
+    def expose_port(self, port: int, command: str = None, allow_public: bool = True):
+        """暴露沙箱端口供外部访问。
+
+        Args:
+            port: 沙箱内端口号
+            command: 可选, 在沙箱内后台启动该端口的服务命令
+            allow_public: 是否更新网络配置允许公开访问
+
+        Returns:
+            PortForward: 包含 host, url 等信息的端口转发对象
+        """
+        from managed_e2b.models import PortForward
+        if command:
+            self.sandbox.commands.run(f"{command} &", background=True, timeout=5)
+        if allow_public:
+            try:
+                from e2b import SandboxNetworkUpdate
+                self.sandbox.update_network(
+                    SandboxNetworkUpdate(allow_internet_access=True)
+                )
+            except Exception as e:
+                logger.warning(f"update_network failed (non-fatal): {e}")
+        host = self.get_host(port)
+        return PortForward(
+            port=port,
+            host=host,
+            url=f"https://{host}",
+            command=command,
+            sandbox_id=self.sid,
+        )
+
 
 class _Heartbeat:
     """后台心跳线程: 定期刷新沙箱的 last_heartbeat, 证明它仍被活跃持有。
