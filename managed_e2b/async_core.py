@@ -220,6 +220,55 @@ class AsyncSandboxHandle:
             )
             self.lifecycle.db._conn.commit()
 
+    # ---- 本地端口隧道: 让沙箱访问本地服务 ----
+    async def tunnel_local_http(self, tunnel_url: str, alias: str = "local-api"):
+        """配置沙箱通过公网隧道 URL 访问本地服务 (cloudflared/ngrok 方案)。
+
+        在沙箱内 /etc/hosts 添加 alias 映射。
+
+        Args:
+            tunnel_url: 公网隧道 URL (如 https://xxx.trycloudflare.com)
+            alias: 沙箱内 /etc/hosts 的别名 (默认 "local-api")
+
+        Returns:
+            dict: {alias, tunnel_url, sandbox_host}
+        """
+        host = tunnel_url.replace("https://", "").replace("http://", "").rstrip("/")
+        try:
+            await self.sandbox.commands.run(
+                f"echo '127.0.0.1 {alias}' | sudo tee -a /etc/hosts",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"tunnel_local_http /etc/hosts failed (non-fatal): {e}")
+        return {
+            "alias": alias,
+            "tunnel_url": tunnel_url,
+            "sandbox_host": host,
+        }
+
+    def ssh_reverse_tunnel_cmd(self, local_port: int, sandbox_port: int = 9000) -> str:
+        """生成 SSH 反向隧道命令 (在本地执行, 非沙箱内)。
+
+        将本地 local_port 通过 SSH 反向转发到沙箱的 sandbox_port。
+        前提: 沙箱模板已配置 sshd + websocat。
+
+        Args:
+            local_port: 本地要暴露的端口号
+            sandbox_port: 沙箱内映射的端口号 (默认 9000)
+
+        Returns:
+            str: 在本地执行的 SSH 命令字符串
+        """
+        host = self.sandbox.get_host(8081)
+        return (
+            "ssh -N -f "
+            "  -o ExitOnForwardFailure=yes "
+            f"  -o 'ProxyCommand=websocat --binary -B 65536 - wss://{host}' "
+            f"  -R 127.0.0.1:{sandbox_port}:127.0.0.1:{local_port} "
+            f"  user@{self.sid}"
+        )
+
 
 class AsyncSandboxLifecycle:
     """异步生命周期管理器。SandboxDB 复用 (经 to_thread); 3 个 asyncio limiter;

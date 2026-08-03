@@ -500,6 +500,61 @@ class SandboxHandle:
             self.lifecycle.db._conn.commit()
         return True
 
+    # ---- 本地端口隧道: 让沙箱访问本地服务 ----
+    def tunnel_local_http(self, tunnel_url: str, alias: str = "local-api"):
+        """配置沙箱通过公网隧道 URL 访问本地服务 (cloudflared/ngrok 方案)。
+
+        在沙箱内 /etc/hosts 添加 alias → tunnel_url 的映射, 使本地服务
+        可以通过友好域名访问。tunnel_url 是本地 cloudflared/ngrok 输出的公网地址。
+
+        Args:
+            tunnel_url: 公网隧道 URL (如 https://xxx.trycloudflare.com)
+            alias: 沙箱内 /etc/hosts 的别名 (默认 "local-api")
+
+        Returns:
+            dict: {alias, tunnel_url, sandbox_host} — sandbox_host 是沙箱内访问地址
+        """
+        # 提取 host (去掉 scheme)
+        host = tunnel_url.replace("https://", "").replace("http://", "").rstrip("/")
+        # 在沙箱内 /etc/hosts 添加映射 (best-effort, 失败不阻塞)
+        try:
+            self.sandbox.commands.run(
+                f"echo '127.0.0.1 {alias}' | sudo tee -a /etc/hosts",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"tunnel_local_http /etc/hosts failed (non-fatal): {e}")
+        return {
+            "alias": alias,
+            "tunnel_url": tunnel_url,
+            "sandbox_host": host,
+        }
+
+    def ssh_reverse_tunnel_cmd(self, local_port: int, sandbox_port: int = 9000) -> str:
+        """生成 SSH 反向隧道命令 (在本地执行, 非沙箱内)。
+
+        将本地 local_port 通过 SSH 反向转发到沙箱的 sandbox_port。
+        前提: 沙箱模板已配置 sshd + websocat (见 E2B SSH access 文档)。
+
+        生成的命令在本地终端执行后:
+        - 沙箱内 curl http://127.0.0.1:sandbox_port → 访问本地 local_port
+
+        Args:
+            local_port: 本地要暴露的端口号
+            sandbox_port: 沙箱内映射的端口号 (默认 9000)
+
+        Returns:
+            str: 在本地执行的 SSH 命令字符串
+        """
+        host = self.get_host(8081)  # E2B SSH 端口通常是 8081
+        return (
+            "ssh -N -f "
+            "  -o ExitOnForwardFailure=yes "
+            f"  -o 'ProxyCommand=websocat --binary -B 65536 - wss://{host}' "
+            f"  -R 127.0.0.1:{sandbox_port}:127.0.0.1:{local_port} "
+            f"  user@{self.sid}"
+        )
+
 
 class _Heartbeat:
     """后台心跳线程: 定期刷新沙箱的 last_heartbeat, 证明它仍被活跃持有。
