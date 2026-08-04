@@ -109,6 +109,37 @@ with lc.acquire(template="base") as h:
 
 Credentials can also go in a `.env` file (see `.env.example`); `load_env()` reads it.
 
+### Port forwarding (expose sandbox ports)
+
+Get the host address to connect to a sandbox port from outside, or expose a port
+with an optional server command:
+
+```python
+with lc.acquire(template="base", timeout=300) as h:
+    # Just get the host address for a port
+    host = h.get_host(3000)  # e.g. "3000-sbx123.e2b.app"
+    url = h.get_url(3000)    # "https://3000-sbx123.e2b.app"
+
+    # Expose a port: start a server + get the external address
+    pf = h.expose_port(8080, command="python3 -m http.server 8080")
+    print(pf.host)  # "8080-sbx123.e2b.app"
+    print(pf.url)   # "https://8080-sbx123.e2b.app"
+    # pf.port, pf.command, pf.sandbox_id also available
+```
+
+Async version (`AsyncSandboxHandle`):
+
+```python
+async with lc.acquire(template="base", timeout=300) as h:
+    host = await h.get_host(3000)
+    url = await h.get_url(3000)
+    pf = await h.expose_port(8080, command="node server.js")
+```
+
+`expose_port` optionally calls `sandbox.update_network()` to allow public traffic
+(set `allow_public=False` to skip). The `PortForward` model (pydantic v2) holds
+`port`, `host`, `url`, `command`, and `sandbox_id`.
+
 ## Use with evalscope
 
 `managed_e2b_evalscope.py` is a drop-in backend that runs evalscope's code

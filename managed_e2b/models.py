@@ -173,3 +173,15 @@ class AcquireRequest(BaseModel):
         if len(provided) > 1:
             raise ValueError("image/dockerfile/template 三选一, 不能同时传多个")
         return self
+
+
+class PortForward(BaseModel):
+    """Represents an exposed sandbox port for external access."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    port: int = Field(..., ge=1, le=65535, description="Port number inside the sandbox")
+    host: str = Field(..., description="Host address to connect to the sandbox port from outside")
+    url: str = Field(..., description="Full URL to connect to the sandbox port from outside")
+    command: Optional[str] = Field(None, description="Command that started the server on this port (if any)")
+    sandbox_id: str = Field("", description="Sandbox ID this port forward belongs to")

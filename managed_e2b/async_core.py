@@ -132,6 +132,143 @@ class AsyncSandboxHandle:
             self.lifecycle._hb_tasks.add(hb._task)
         return h
 
+    # ---- 端口转发: 获取沙箱端口的外部访问地址 ----
+    async def get_host(self, port: int) -> str:
+        """获取沙箱端口的外部访问主机地址 (host:port 格式)。
+        用此地址可从沙箱外部通过 HTTP/WebSocket 连接到沙箱内端口。"""
+        return self.sandbox.get_host(port)
+
+    async def get_url(self, port: int, scheme: str = "https") -> str:
+        """获取沙箱端口的外部访问完整 URL。
+        scheme: http 或 https (默认 https)"""
+        host = self.sandbox.get_host(port)
+        return f"{scheme}://{host}"
+
+    async def expose_port(self, port: int, command: str = None, allow_public: bool = True):
+        """暴露沙箱端口供外部访问。记录到 sqlite (生命周期追踪)。
+
+        Args:
+            port: 沙箱内端口号
+            command: 可选, 在沙箱内后台启动该端口的服务命令
+            allow_public: 是否更新网络配置允许公开访问
+
+        Returns:
+            PortForward: 包含 host, url 等信息的端口转发对象
+        """
+        from managed_e2b.models import PortForward
+        if command:
+            await self.sandbox.commands.run(f"{command} &", background=True, timeout=5)
+        if allow_public:
+            try:
+                from e2b import SandboxNetworkUpdate
+                self.sandbox.update_network(
+                    SandboxNetworkUpdate(allow_internet_access=True)
+                )
+            except Exception as e:
+                logger.warning(f"update_network failed (non-fatal): {e}")
+        host = self.sandbox.get_host(port)
+        pf = PortForward(
+            port=port,
+            host=host,
+            url=f"https://{host}",
+            command=command,
+            sandbox_id=self.sid,
+        )
+        # 落盘: 端口转发生命周期追踪
+        if self.lifecycle:
+            await asyncio.to_thread(
+                self.lifecycle.db.record_port_forward,
+                self.sid, port, host, pf.url, command,
+            )
+        return pf
+
+    async def list_ports(self) -> list:
+        """列出当前沙箱已暴露的端口 (从 sqlite 查)。返回 PortForward 列表。"""
+        from managed_e2b.models import PortForward
+        if not self.lifecycle:
+            return []
+        rows = await asyncio.to_thread(self.lifecycle.db.list_port_forwards, self.sid)
+        return [PortForward(
+            port=r["port"], host=r["host"], url=r["url"],
+            command=r["command"], sandbox_id=r["sandbox_id"],
+        ) for r in rows]
+
+    async def close_port(self, port: int) -> bool:
+        """关闭沙箱端口: kill 进程 + 删 sqlite 记录。"""
+        if not self.lifecycle:
+            return False
+        rows = await asyncio.to_thread(self.lifecycle.db.list_port_forwards, self.sid)
+        found = any(r["port"] == port for r in rows)
+        if not found:
+            return False
+        try:
+            await self.sandbox.commands.run(
+                f"sh -c 'fuser -k {port}/tcp 2>/dev/null; pkill -f :{port} 2>/dev/null; true'",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"close_port kill process on {port} failed (non-fatal): {e}")
+        await asyncio.to_thread(self._delete_port_forward, self.sid, port)
+        return True
+
+    def _delete_port_forward(self, sandbox_id: str, port: int):
+        """同步删 sqlite 记录 (供 to_thread 调用)。"""
+        with self.lifecycle.db._lock:
+            self.lifecycle.db._conn.execute(
+                "DELETE FROM port_forwards WHERE sandbox_id=? AND port=?",
+                (sandbox_id, port),
+            )
+            self.lifecycle.db._conn.commit()
+
+    # ---- 本地端口隧道: 让沙箱访问本地服务 ----
+    async def tunnel_local_http(self, tunnel_url: str, alias: str = "local-api"):
+        """配置沙箱通过公网隧道 URL 访问本地服务 (cloudflared/ngrok 方案)。
+
+        在沙箱内 /etc/hosts 添加 alias 映射。
+
+        Args:
+            tunnel_url: 公网隧道 URL (如 https://xxx.trycloudflare.com)
+            alias: 沙箱内 /etc/hosts 的别名 (默认 "local-api")
+
+        Returns:
+            dict: {alias, tunnel_url, sandbox_host}
+        """
+        host = tunnel_url.replace("https://", "").replace("http://", "").rstrip("/")
+        try:
+            await self.sandbox.commands.run(
+                f"echo '127.0.0.1 {alias}' | sudo tee -a /etc/hosts",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"tunnel_local_http /etc/hosts failed (non-fatal): {e}")
+        return {
+            "alias": alias,
+            "tunnel_url": tunnel_url,
+            "sandbox_host": host,
+        }
+
+    def ssh_reverse_tunnel_cmd(self, local_port: int, sandbox_port: int = 9000) -> str:
+        """生成 SSH 反向隧道命令 (在本地执行, 非沙箱内)。
+
+        将本地 local_port 通过 SSH 反向转发到沙箱的 sandbox_port。
+        前提: 沙箱模板已配置 sshd + websocat。
+
+        Args:
+            local_port: 本地要暴露的端口号
+            sandbox_port: 沙箱内映射的端口号 (默认 9000)
+
+        Returns:
+            str: 在本地执行的 SSH 命令字符串
+        """
+        host = self.sandbox.get_host(8081)
+        return (
+            "ssh -N -f "
+            "  -o ExitOnForwardFailure=yes "
+            f"  -o 'ProxyCommand=websocat --binary -B 65536 - wss://{host}' "
+            f"  -R 127.0.0.1:{sandbox_port}:127.0.0.1:{local_port} "
+            f"  user@{self.sid}"
+        )
+
 
 class AsyncSandboxLifecycle:
     """异步生命周期管理器。SandboxDB 复用 (经 to_thread); 3 个 asyncio limiter;
@@ -241,6 +378,8 @@ class AsyncSandboxLifecycle:
                 await asyncio.to_thread(self.db.upsert, sid, **rec.to_db_row())
             else:
                 await asyncio.to_thread(self.db.set_state, sid, State.CLEANED)
+                # 清理该沙箱的端口转发记录
+                await asyncio.to_thread(self.db.delete_port_forwards, sid)
         else:
             logger.warning(f"kill {sid} 后 is_running 仍 True, 留 CLEANING 待重试")
         return confirmed
