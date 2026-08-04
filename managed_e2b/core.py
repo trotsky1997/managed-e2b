@@ -555,6 +555,111 @@ class SandboxHandle:
             f"  user@{self.sid}"
         )
 
+    def expose_local(
+        self,
+        local_port: int,
+        sandbox_port: int | None = None,
+        *,
+        ssh_key: str | None = None,
+        ssh_user: str = "root",
+    ) -> "PortForward":
+        """将本地服务通过 SSH 反向隧道转发到沙箱内。
+
+        在沙箱内自动安装 sshd + websocat, 启动 WSS bridge, 然后在本地
+        建立 SSH -R 反向隧道, 使沙箱内 curl http://127.0.0.1:sandbox_port
+        → 访问本地的 local_port 服务。沙箱内无需公网 IP / 隧道。
+
+        前提: 本地已安装 ssh + websocat (brew/apt/ scoop install websocat)。
+
+        Args:
+            local_port: 本地要暴露的端口号 (如 18080 = anyharness adapter)
+            sandbox_port: 沙箱内映射端口 (默认 = local_port)
+            ssh_key: 本地 SSH 私钥路径 (默认 ~/.ssh/id_e2b)
+            ssh_user: SSH 用户 (默认 root)
+
+        Returns:
+            PortForward: {port, host, url} — sandbox_port 是沙箱内访问端口
+        """
+        import subprocess as _sp
+        import pathlib as _pl
+
+        if sandbox_port is None:
+            sandbox_port = local_port
+
+        # 1. 沙箱内安装 sshd + websocat
+        self.run("sudo apt-get update -qq 2>&1 | tail -1", timeout=60)
+        self.run("sudo apt-get install -y -qq openssh-server 2>&1 | tail -1", timeout=60)
+        self.run(
+            "curl -sL https://github.com/vi/websocat/releases/latest/download/"
+            "websocat.x86_64-unknown-linux-musl -o /usr/local/bin/websocat "
+            "&& chmod +x /usr/local/bin/websocat",
+            timeout=30,
+        )
+
+        # 2. 配置 sshd + 注入公钥
+        self.run('sudo sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config')
+        self.run('sudo sed -i "s/#PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config')
+        self.run("sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh")
+
+        key_path = _pl.Path(ssh_key) if ssh_key else _pl.Path.home() / ".ssh/id_e2b"
+        if not key_path.exists():
+            # Generate key pair
+            _sp.run(["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-q"],
+                   capture_output=True)
+        pubkey = key_path.with_suffix(".pub").read_text().strip()
+        self.run(f'echo "{pubkey}" | sudo tee /root/.ssh/authorized_keys')
+        self.run("sudo chmod 600 /root/.ssh/authorized_keys")
+        self.run("sudo ssh-keygen -A 2>&1 | tail -1")
+        self.run("sudo /usr/sbin/sshd")
+
+        # 3. 启动 websocat bridge: WS 8081 → SSH 22
+        self.run(
+            "nohup sudo websocat -b --exit-on-eof ws-l:0.0.0.0:8081 "
+            "tcp:127.0.0.1:22 > /tmp/websocat.log 2>&1 & echo PID=$!",
+            timeout=5,
+        )
+        import time as _t; _t.sleep(2)
+
+        # 4. 暴露 8081 端口
+        self.expose_port(8081)
+        wss_host = self.get_host(8081)
+        wss_url = f"wss://{wss_host}"
+
+        # 5. 本地建立 SSH -R 反向隧道 (Popen, 不等 — SSH -N 保持连接)
+        # 不用 -f: Windows 下 -f + ProxyCommand + capture_output 会 hang
+        ssh_cmd = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ConnectTimeout=15",
+            "-o", f"ProxyCommand=websocat --binary -B 65536 - {wss_url}",
+            "-R", f"127.0.0.1:{sandbox_port}:127.0.0.1:{local_port}",
+            "-N",
+            f"{ssh_user}@{self.sid}",
+        ]
+        tunnel_proc = _sp.Popen(
+            ssh_cmd, stdin=_sp.DEVNULL,
+            stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        # Wait for tunnel to establish (ExitOnForwardFailure means ssh exits
+        # immediately if the -R fails). Give it 5s to connect.
+        import time as _t2
+        _t2.sleep(5)
+        if tunnel_proc.poll() is not None:
+            # Process already exited — tunnel failed
+            err = tunnel_proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"SSH reverse tunnel failed: {err[:300]}")
+
+        from managed_e2b.models import PortForward
+        return PortForward(
+            port=sandbox_port,
+            host=f"127.0.0.1:{sandbox_port}",
+            url=f"http://127.0.0.1:{sandbox_port}",
+            sandbox_id=self.sid,
+        )
+
 
 class _Heartbeat:
     """后台心跳线程: 定期刷新沙箱的 last_heartbeat, 证明它仍被活跃持有。
