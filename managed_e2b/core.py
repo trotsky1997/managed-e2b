@@ -44,6 +44,401 @@ from typing import Optional
 logger = logging.getLogger("sandbox_lifecycle")
 
 
+# ---------------- chisel 反向隧道 (issue #2 的成熟方案) ----------------
+# chisel (jpillora/chisel): 单 Go 二进制, 原生反向隧道 (R: spec), 内建多路复用/
+# 重连/keepalive。比手写 WS mux + ssh -R 都更稳, 对 claude-cli/Bun 等任意 HTTP
+# 客户端完全透明 (无 --exit-on-eof 那种 EOF 拆桥问题)。
+#
+# release 命名: chisel_<ver>_<os>_<arch>.{gz|zip}
+#   linux/darwin → .gz (gzip 单二进制); windows → .zip (含 .exe)
+
+_CHISEL_VERSION = "1.11.8"
+_CHISEL_REPO = "jpillora/chisel"
+
+# (archive_suffix, binary_name_inside) per (os, arch)
+# 二进制名: linux/darwin = chisel; windows = chisel.exe
+_CHISEL_ASSETS = {
+    ("linux", "amd64"): ("gz", "chisel"),
+    ("linux", "arm64"): ("gz", "chisel"),
+    ("linux", "386"): ("gz", "chisel"),
+    ("linux", "armv5"): ("gz", "chisel"),
+    ("darwin", "amd64"): ("gz", "chisel"),
+    ("darwin", "arm64"): ("gz", "chisel"),
+    ("windows", "amd64"): ("zip", "chisel.exe"),
+    ("windows", "386"): ("zip", "chisel.exe"),
+    ("windows", "arm64"): ("zip", "chisel.exe"),
+}
+
+
+def chisel_release_asset(platform: str, arch: str) -> tuple[str, str, str]:
+    """返回 (download_url, archive_suffix, binary_name)。
+
+    platform: 'linux' | 'darwin' | 'windows' (接受 sys.platform 的 'win32'/'cygwin'→windows)
+    arch: 'amd64' | 'arm64' | '386' | 'armv5' (接受 platform.machine 的变体)
+
+    纯函数, 不联网 — 用于沙箱内 (linux_amd64) 与本地 (windows_amd64 等) 的二进制下载。
+    """
+    # 归一化 platform
+    p = platform.lower()
+    if p in ("win32", "cygwin", "msys"):
+        p = "windows"
+    # 归一化 arch
+    a = arch.lower()
+    a = {"x86_64": "amd64", "x64": "amd64", "aarch64": "arm64",
+         "i386": "386", "i686": "386", "armv7l": "armv5"}.get(a, a)
+    key = (p, a)
+    if key not in _CHISEL_ASSETS:
+        raise ValueError(
+            f"no chisel release asset for platform={platform!r} arch={arch!r} "
+            f"(normalized {key}); supported: {sorted(_CHISEL_ASSETS)}")
+    suffix, binname = _CHISEL_ASSETS[key]
+    asset = f"chisel_{_CHISEL_VERSION}_{p}_{a}.{suffix}"
+    url = (f"https://github.com/{_CHISEL_REPO}/releases/download/"
+           f"v{_CHISEL_VERSION}/{asset}")
+    return url, suffix, binname
+
+
+def _chisel_cache_dir() -> "_pl.Path":
+    """chisel 二进制的本地缓存目录 (跨平台)。~/.cache/managed_e2b/chisel/。"""
+    import pathlib as _pl
+    cache = _pl.Path.home() / ".cache" / "managed_e2b" / "chisel"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def ensure_local_chisel() -> "_pl.Path":
+    """确保本地有 chisel client 二进制, 返回其路径 (下载到缓存, 命中即跳过)。
+
+    Windows 上 Go 编译的 chisel.exe 常被杀软误报隔离 (反向隧道能力 + 未签名)。
+    若下载后进程跑不起来 (被删/被拦), 抛 RuntimeError 并附加白引导。
+    """
+    import platform as _pf
+    import subprocess as _sp
+    import pathlib as _pl
+
+    url, suffix, binname = chisel_release_asset(_pf.system().lower(), _pf.machine().lower())
+    bin_path = _chisel_cache_dir() / binname
+    if bin_path.exists() and bin_path.stat().st_size > 1_000_000:
+        # 已缓存; 验证能跑 (杀软可能事后删了它 / 锁了它)
+        try:
+            _sp.run([str(bin_path), "--version"], capture_output=True, timeout=10, check=False)
+            return bin_path
+        except (OSError, _sp.SubprocessError) as e:
+            logger.warning(f"cached chisel at {bin_path} unusable ({e}); redownloading")
+            try:
+                bin_path.unlink()
+            except OSError:
+                pass
+
+    import urllib.request as _ur
+    import gzip, zipfile, io
+    archive = _chisel_cache_dir() / f"chisel.{suffix}"
+    logger.info(f"downloading chisel {binname} from {url}")
+    _ur.urlretrieve(url, archive)
+    if suffix == "gz":
+        with gzip.open(archive, "rb") as gz, open(bin_path, "wb") as out:
+            out.write(gz.read())
+    else:  # zip
+        with zipfile.ZipFile(archive) as z:
+            z.extract(binname, _chisel_cache_dir())
+    archive.unlink(missing_ok=True)
+    try:
+        bin_path.chmod(0o755)
+    except OSError:
+        pass  # Windows 忽略
+
+    # 下载后立刻 smoke-test: 跑 --version。若杀软把它删了/拦了, 这里会失败。
+    try:
+        r = _sp.run([str(bin_path), "--version"], capture_output=True, timeout=10, check=False)
+    except OSError as e:
+        raise RuntimeError(
+            f"chisel client 二进制下载后无法执行 ({e})。"
+            f"很可能是杀软隔离了它 (Go 反向隧道二进制高误报)。"
+            f"请把 {bin_path} 加入杀软白名单后重试。"
+        ) from e
+    if r.returncode != 0 and not r.stdout:
+        raise RuntimeError(
+            f"chisel client 跑不起来 (rc={r.returncode}, stderr={r.stderr[:200]!r})。"
+            f"多半被杀软拦截, 请把 {bin_path} 加白后重试。"
+        )
+    return bin_path
+
+
+# ---------------- cloudflared quick tunnel (本地→公网, issue #2 的补充方案) ----------------
+# cloudflared (cloudflare/cloudflared): Cloudflare 官方签名二进制, 杀软基本不拦。
+# 与 chisel 不同: 它是 本地→公网 方向 —— 本地跑 quick tunnel 拿一个 trycloudflare.com
+# 公网 URL, 沙箱直接 curl 该公网 URL → 命中本地服务。代价: 本地服务暴露到公网
+# (quick tunnel 无 auth, 任何拿到 URL 的人可访问; 仅适合临时/可信环境, 用完即弃)。
+#
+# release 命名: cloudflared-<os>-<arch>[.tgz|.exe]
+#   linux → 裸二进制 (cloudflared-linux-amd64); darwin → .tgz; windows → .exe
+
+_CFLARED_VERSION = "2026.7.3"
+_CFLARED_REPO = "cloudflare/cloudflared"
+
+# (archive_suffix, binary_name) per (os, arch); suffix None = 裸二进制直接下
+_CFLARED_ASSETS = {
+    ("linux", "amd64"): (None, "cloudflared"),
+    ("linux", "386"): (None, "cloudflared"),
+    ("linux", "arm64"): (None, "cloudflared"),
+    ("linux", "arm"): (None, "cloudflared"),
+    ("linux", "armhf"): (None, "cloudflared"),
+    ("darwin", "amd64"): ("tgz", "cloudflared"),
+    ("darwin", "arm64"): ("tgz", "cloudflared"),
+    ("windows", "amd64"): ("exe", "cloudflared.exe"),
+    ("windows", "386"): ("exe", "cloudflared.exe"),
+    ("windows", "arm64"): ("exe", "cloudflared.exe"),
+}
+
+
+def cloudflared_release_asset(platform: str, arch: str) -> tuple[str, str, str]:
+    """返回 (download_url, archive_suffix|None, binary_name)。纯函数, 不联网。"""
+    p = platform.lower()
+    if p in ("win32", "cygwin", "msys"):
+        p = "windows"
+    a = arch.lower()
+    a = {"x86_64": "amd64", "x64": "amd64", "aarch64": "arm64",
+         "i386": "386", "i686": "386", "armv7l": "arm", "armv6l": "armhf"}.get(a, a)
+    key = (p, a)
+    if key not in _CFLARED_ASSETS:
+        raise ValueError(
+            f"no cloudflared release asset for platform={platform!r} arch={arch!r} "
+            f"(normalized {key}); supported: {sorted(_CFLARED_ASSETS)}")
+    suffix, binname = _CFLARED_ASSETS[key]
+    if suffix is None:
+        asset = f"cloudflared-{p}-{a}"
+    elif suffix == "tgz":
+        asset = f"cloudflared-{p}-{a}.tgz"
+    else:
+        asset = f"cloudflared-{p}-{a}.{suffix}"
+    url = (f"https://github.com/{_CFLARED_REPO}/releases/download/"
+           f"{_CFLARED_VERSION}/{asset}")
+    return url, suffix, binname
+
+
+def _cloudflared_cache_dir() -> "_pl.Path":
+    import pathlib as _pl
+    cache = _pl.Path.home() / ".cache" / "managed_e2b" / "cloudflared"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def ensure_local_cloudflared() -> "_pl.Path":
+    """确保本地有 cloudflared 二进制 (Cloudflare 官方签名, 杀软不拦), 返回其路径。
+
+    下载到 ~/.cache/managed_e2b/cloudflared/; 命中缓存跳过。下载后 smoke-test --version。
+    """
+    import platform as _pf
+    import subprocess as _sp
+    import pathlib as _pl
+
+    url, suffix, binname = cloudflared_release_asset(_pf.system().lower(), _pf.machine().lower())
+    bin_path = _cloudflared_cache_dir() / binname
+    if bin_path.exists() and bin_path.stat().st_size > 1_000_000:
+        try:
+            _sp.run([str(bin_path), "--version"], capture_output=True, timeout=15, check=False)
+            return bin_path
+        except (OSError, _sp.SubprocessError) as e:
+            logger.warning(f"cached cloudflared at {bin_path} unusable ({e}); redownloading")
+            try:
+                bin_path.unlink()
+            except OSError:
+                pass
+
+    import urllib.request as _ur
+    import tarfile, gzip, io
+    logger.info(f"downloading cloudflared {binname} from {url}")
+    if suffix is None:
+        # 裸二进制, 直接下
+        _ur.urlretrieve(url, bin_path)
+    elif suffix == "tgz":
+        archive = _cloudflared_cache_dir() / "cloudflared.tgz"
+        _ur.urlretrieve(url, archive)
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extract(_tf_member(tf, binname), _cloudflared_cache_dir())
+        archive.unlink(missing_ok=True)
+    else:  # exe: 资产本身就是 .exe, 直接下
+        _ur.urlretrieve(url, bin_path)
+    try:
+        bin_path.chmod(0o755)
+    except OSError:
+        pass
+
+    try:
+        r = _sp.run([str(bin_path), "--version"], capture_output=True, timeout=15, check=False)
+    except OSError as e:
+        raise RuntimeError(
+            f"cloudflared 二进制下载后无法执行 ({e})。请把 {bin_path} 加入杀软白名单后重试。"
+        ) from e
+    if r.returncode != 0 and not r.stdout:
+        raise RuntimeError(
+            f"cloudflared 跑不起来 (rc={r.returncode}, stderr={r.stderr[:200]!r})。"
+            f"多半被杀软拦截, 请把 {bin_path} 加白后重试。"
+        )
+    return bin_path
+
+
+def _tf_member(tf: "tarfile.TarFile", name: str):
+    """在 tarfile 里按 basename 找成员 (cloudflared 的 tar 里可能叫 cloudflared 或 cloudflared.exe)。"""
+    import os as _o
+    for m in tf.getmembers():
+        if _o.path.basename(m.name) == name:
+            return m
+    # 退而求其次: 取第一个可执行文件成员
+    for m in tf.getmembers():
+        if m.isfile():
+            return m
+    raise KeyError(f"no member matching {name!r} in tar")
+
+
+def parse_cloudflared_quick_url(stderr_text: str) -> str | None:
+    """从 cloudflared quick tunnel 的 stderr 里解析 trycloudflare.com 公网 URL。
+
+    cloudflared 把 URL 打成两行 (Visit it at: ... | https://xxx.trycloudflare.com |),
+    这里直接抓 https://<...>.trycloudflare.com 即可。抓不到返回 None。
+    """
+    import re
+    m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", stderr_text)
+    return m.group(0) if m else None
+
+
+# ---------------- cloudflared named tunnel (API token 模式, 稳定域名) ----------------
+# 与 quick tunnel 不同: 用 CLOUDFLARE_API_TOKEN 走 REST API 建一个命名 tunnel 并绑到你
+# 自己的域名 (如 adapter.yourdomain.com), URL 稳定可复用。流程 (全程非交互, 只靠环境变量):
+#   1. POST   /accounts/{aid}/cfd_tunnel            {name, config_src:"cloudflare"}
+#      → 返回 {id, token} (tunnel 已建)
+#   2. PUT    /accounts/{aid}/cfd_tunnel/{id}/configurations
+#      {config:{ingress:[{hostname, service:http://localhost:port}, {service:http_status:404}]}}
+#   3. POST   /zones/{zid}/dns_records
+#      {type:"CNAME", name:<hostname>, content:"<id>.cfargotunnel.com", proxied:true}
+#   4. cloudflared tunnel run --token <token>      (本地常驻进程)
+# 沙箱直接访问 https://<hostname> → 经 Cloudflare 边缘 → 本地 local_port。
+# tunnel 复用: 同 (account, tunnel_name) 的 tunnel 已存在就 GET 列表里取, 不重建。
+
+def _cf_named_env() -> dict | None:
+    """读 named-tunnel 所需环境变量。齐全返回 dict, 否则 None (走 quick tunnel)。"""
+    import os as _o
+    token = _o.environ.get("CLOUDFLARE_API_TOKEN")
+    account = _o.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    zone_name = _o.environ.get("CLOUDFLARE_ZONE_NAME")  # 如 yourdomain.com
+    hostname = _o.environ.get("CLOUDFLARE_TUNNEL_HOSTNAME")  # 如 adapter.yourdomain.com
+    if not (token and account and zone_name and hostname):
+        return None
+    return {
+        "token": token, "account_id": account, "zone_name": zone_name,
+        "hostname": hostname,
+        "tunnel_name": _o.environ.get("CLOUDFLARE_TUNNEL_NAME", "managed-e2b"),
+    }
+
+
+def _cf_api(method: str, path: str, cfg: dict, *, json_body: dict | None = None) -> dict:
+    """调 Cloudflare REST API (api.cloudflare.com), 返回 JSON result。失败抛 RuntimeError。"""
+    import json as _j
+    import urllib.request as _ur
+    import urllib.error as _ue
+    url = f"https://api.cloudflare.com/client/v4{path}"
+    data = _j.dumps(json_body).encode() if json_body is not None else None
+    req = _ur.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {cfg['token']}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with _ur.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+    except _ue.HTTPError as e:
+        body = e.read().decode(errors="replace")[:400]
+        raise RuntimeError(f"Cloudflare API {method} {path} → HTTP {e.code}: {body}") from e
+    payload = _j.loads(raw)
+    if not payload.get("success", False):
+        errs = payload.get("errors") or payload.get("messages") or []
+        raise RuntimeError(f"Cloudflare API {method} {path} failed: {errs}")
+    return payload.get("result") or {}
+
+
+def _cf_zone_id(cfg: dict) -> str:
+    """查 zone id (按 zone_name)。带缓存 (一个 zone 名只查一次)。"""
+    cache = _cf_named_state.setdefault("zone_ids", {})
+    if cfg["zone_name"] in cache:
+        return cache[cfg["zone_name"]]
+    r = _cf_api("GET", f"/zones?name={cfg['zone_name']}", cfg)
+    zones = r if isinstance(r, list) else r.get("result", r) if isinstance(r, dict) else r
+    if not zones:
+        raise RuntimeError(f"Cloudflare zone {cfg['zone_name']!r} 未找到 (查 /zones?name=)")
+    zid = zones[0]["id"] if isinstance(zones[0], dict) else zones[0]
+    cache[cfg["zone_name"]] = zid
+    return zid
+
+
+# named tunnel 跨调用缓存: {(account, tunnel_name): {"tunnel_id","token"}}
+_cf_named_state: dict = {}
+
+
+def _cf_get_or_create_tunnel(cfg: dict) -> tuple[str, str]:
+    """复用或新建命名 tunnel, 返回 (tunnel_id, run_token)。
+
+    优先从 _cf_named_state 缓存取 (同进程多次 expose 复用); 没有就列表查同名 tunnel;
+    再没有就 POST 新建。token 优先用新建返回的; 复用已存在 tunnel 时走 GET .../token 取。
+    """
+    key = (cfg["account_id"], cfg["tunnel_name"])
+    if key in _cf_named_state:
+        c = _cf_named_state[key]
+        return c["tunnel_id"], c["token"]
+    # 列表查同名
+    base = f"/accounts/{cfg['account_id']}/cfd_tunnel"
+    existing = _cf_api("GET", f"{base}?name={cfg['tunnel_name']}", cfg)
+    existing = existing if isinstance(existing, list) else (existing.get("result", []) if isinstance(existing, dict) else [])
+    if existing:
+        t = existing[0]
+        tid = t["id"]
+        # token 不能从列表拿到, 单独 GET
+        token = _cf_api("GET", f"{base}/{tid}/token", cfg)
+        if isinstance(token, dict):  # 某些版本返回 {result: "..."}
+            token = token.get("result") or token.get("token") or ""
+        _cf_named_state[key] = {"tunnel_id": tid, "token": token}
+        return tid, token
+    # 新建
+    r = _cf_api("POST", base, cfg, json_body={
+        "name": cfg["tunnel_name"], "config_src": "cloudflare",
+    })
+    tid = r["id"]
+    token = r.get("token") or ""
+    if not token:  # 个别版本要单独 GET
+        token = _cf_api("GET", f"{base}/{tid}/token", cfg)
+        if isinstance(token, dict):
+            token = token.get("result") or token.get("token") or ""
+    _cf_named_state[key] = {"tunnel_id": tid, "token": token}
+    return tid, token
+
+
+def _cf_put_ingress(cfg: dict, tunnel_id: str, local_port: int) -> None:
+    """PUT tunnel ingress 配置: hostname → http://localhost:port, 兜底 404。"""
+    body = {
+        "config": {
+            "ingress": [
+                {"hostname": cfg["hostname"], "service": f"http://localhost:{local_port}"},
+                {"service": "http_status:404"},  # 必须的 terminating catch-all
+            ]
+        }
+    }
+    _cf_api("PUT", f"/accounts/{cfg['account_id']}/cfd_tunnel/{tunnel_id}/configurations",
+            cfg, json_body=body)
+
+
+def _cf_ensure_dns_cname(cfg: dict, tunnel_id: str) -> None:
+    """确保 DNS CNAME: {hostname} → {tunnel_id}.cfargotunnel.com (proxied)。已存在则跳过。"""
+    zid = _cf_zone_id(cfg)
+    target = f"{tunnel_id}.cfargotunnel.com"
+    # 查是否已有该 CNAME
+    recs = _cf_api("GET", f"/zones/{zid}/dns_records?name={cfg['hostname']}", cfg)
+    recs = recs if isinstance(recs, list) else (recs.get("result", []) if isinstance(recs, dict) else [])
+    for r in recs:
+        if isinstance(r, dict) and r.get("type") == "CNAME" and r.get("content") == target:
+            return  # 已存在, 跳过
+    _cf_api("POST", f"/zones/{zid}/dns_records", cfg, json_body={
+        "type": "CNAME", "name": cfg["hostname"], "content": target, "proxied": True,
+    })
+
+
 # ---------------- sqlite 真相源 ----------------
 
 _SCHEMA = """
@@ -530,127 +925,284 @@ class SandboxHandle:
             "sandbox_host": host,
         }
 
-    def ssh_reverse_tunnel_cmd(self, local_port: int, sandbox_port: int = 9000) -> str:
-        """生成 SSH 反向隧道命令 (在本地执行, 非沙箱内)。
-
-        将本地 local_port 通过 SSH 反向转发到沙箱的 sandbox_port。
-        前提: 沙箱模板已配置 sshd + websocat (见 E2B SSH access 文档)。
-
-        生成的命令在本地终端执行后:
-        - 沙箱内 curl http://127.0.0.1:sandbox_port → 访问本地 local_port
-
-        Args:
-            local_port: 本地要暴露的端口号
-            sandbox_port: 沙箱内映射的端口号 (默认 9000)
-
-        Returns:
-            str: 在本地执行的 SSH 命令字符串
-        """
-        host = self.get_host(8081)  # E2B SSH 端口通常是 8081
-        return (
-            "ssh -N -f "
-            "  -o ExitOnForwardFailure=yes "
-            f"  -o 'ProxyCommand=websocat --binary -B 65536 - wss://{host}' "
-            f"  -R 127.0.0.1:{sandbox_port}:127.0.0.1:{local_port} "
-            f"  user@{self.sid}"
-        )
-
     def expose_local(
         self,
         local_port: int,
         sandbox_port: int | None = None,
         *,
-        ssh_key: str | None = None,
-        ssh_user: str = "root",
+        chisel_port: int = 8082,
+        chisel_token: str | None = None,
     ) -> "PortForward":
-        """将本地服务通过 SSH 反向隧道转发到沙箱内。
+        """将本地服务反向转发到沙箱内 (沙箱内 ``http://127.0.0.1:sandbox_port``
+        → 本地的 local_port)。沙箱无需公网 IP / 隧道。
 
-        在沙箱内自动安装 sshd + websocat, 启动 WSS bridge, 然后在本地
-        建立 SSH -R 反向隧道, 使沙箱内 curl http://127.0.0.1:sandbox_port
-        → 访问本地的 local_port 服务。沙箱内无需公网 IP / 隧道。
+        用 jpillora/chisel —— 单 Go 二进制, 原生反向隧道 (R: spec), 内建多路复用/
+        重连/keepalive/auth token, 对 claude-cli/Bun 等任意 HTTP 客户端完全透明
+        (issue #2 的旧 SSH+websocat 路径会被 ``--exit-on-eof`` 在 Bun 的 keep-alive
+        POST body 读到一半时拆桥 → ``Connection lost``; chisel 无此问题)。
 
-        前提: 本地已安装 ssh + websocat (brew/apt/ scoop install websocat)。
+        - 沙箱内: 下载 linux chisel server (Linux 不被杀软拦), 跑
+          ``chisel server --reverse --port <chisel_port> --auth e2b:<token>``;
+          暴露 chisel_port (E2B 网关 TLS 终结 → 本地拨 wss://)。
+        - 本地: ensure_local_chisel() 拿到本地 chisel client (下载到
+          ~/.cache/managed_e2b/chisel/), 跑
+          ``chisel client --auth e2b:<token> wss://<host> R:127.0.0.1:<sandbox_port>:127.0.0.1:<local_port>``。
+
+        **Windows 上 chisel.exe 可能被杀软误报隔离** (Go 反向隧道二进制高误报)。
+        ensure_local_chisel() 下载后会立刻 smoke-test ``--version``; 被拦时抛带加白
+        引导的 RuntimeError —— 把 chisel.exe 加白后重试即可。
+
+        前提: 本地+沙箱能从 github.com 下载 chisel 二进制。
 
         Args:
             local_port: 本地要暴露的端口号 (如 18080 = anyharness adapter)
             sandbox_port: 沙箱内映射端口 (默认 = local_port)
-            ssh_key: 本地 SSH 私钥路径 (默认 ~/.ssh/id_e2b)
-            ssh_user: SSH 用户 (默认 root)
+            chisel_port: chisel 在沙箱内监听的 WSS 端口 (默认 8082, 会自动暴露)
+            chisel_token: chisel auth token (默认自动生成)
 
         Returns:
             PortForward: {port, host, url} — sandbox_port 是沙箱内访问端口
         """
-        import subprocess as _sp
-        import pathlib as _pl
-
         if sandbox_port is None:
             sandbox_port = local_port
+        return self._expose_local_chisel(
+            local_port, sandbox_port, chisel_port=chisel_port, chisel_token=chisel_token)
 
-        # 1. 沙箱内安装 sshd + websocat
-        self.run("sudo apt-get update -qq 2>&1 | tail -1", timeout=60)
-        self.run("sudo apt-get install -y -qq openssh-server 2>&1 | tail -1", timeout=60)
-        self.run(
-            "curl -sL https://github.com/vi/websocat/releases/latest/download/"
-            "websocat.x86_64-unknown-linux-musl -o /usr/local/bin/websocat "
-            "&& chmod +x /usr/local/bin/websocat",
-            timeout=30,
+    def expose_local_cloudflare(self, local_port: int) -> "PortForward":
+        """用 cloudflared 把本地服务暴露到一个公网 URL, 沙箱直接访问该 URL 即命中本地。
+
+        与 expose_local (chisel, 沙箱内走 127.0.0.1:port) **方向不同**: cloudflared 是
+        本地→公网 —— 本地跑 cloudflared 拿一个公网 URL, 沙箱 curl 该 URL 到达本地。
+        优点: cloudflared 是 Cloudflare 官方签名二进制, 杀软基本不拦; 不需要沙箱侧装
+        任何东西 (沙箱直接访问公网 URL)。
+
+        两种模式 (按环境变量自动选):
+
+        - **named tunnel** (有 key 时, 稳定域名): 设了以下 4 个环境变量就走它 ——
+          ``CLOUDFLARE_API_TOKEN`` + ``CLOUDFLARE_ACCOUNT_ID`` +
+          ``CLOUDFLARE_ZONE_NAME`` (如 yourdomain.com) +
+          ``CLOUDFLARE_TUNNEL_HOSTNAME`` (如 adapter.yourdomain.com)。
+          可选 ``CLOUDFLARE_TUNNEL_NAME`` (默认 "managed-e2b")。
+          用 REST API 建/复用命名 tunnel、配 ingress (hostname → localhost:port)、
+          建 DNS CNAME, 再本地 ``cloudflared tunnel run --token <token>``。
+          URL 稳定不变, 进程重启后复用; 适合长期/反复评测。代价: 本地服务暴露到公网
+          (建议在适配器侧加 token auth, 如 anyharness 的 ADAPTER_AUTH)。
+
+        - **quick tunnel** (默认, 无 key): ``cloudflared tunnel --url http://localhost:port``,
+          拿一个随机 trycloudflare.com URL。URL 每次随机、无 auth 裸奔, 仅适合临时/
+          可信环境, 用完即停。
+
+        本地需能从 github.com 下载 cloudflared 二进制; 沙箱需能访问公网 (E2B 默认允许)。
+
+        Args:
+            local_port: 本地要暴露的端口号 (如 18080 = anyharness adapter)
+
+        Returns:
+            PortForward: host/url 是公网地址 (沙箱直接访问); port 字段填 local_port
+            仅供记录, 沙箱访问用的是 url。
+        """
+        cfg = _cf_named_env()
+        if cfg is not None:
+            return self._cf_named_tunnel(local_port, cfg)
+        return self._cf_quick_tunnel(local_port)
+
+    def _cf_named_tunnel(self, local_port: int, cfg: dict) -> "PortForward":
+        """named tunnel: API token 建隧道 + 绑定自定义域名, URL 稳定。见 expose_local_cloudflare。"""
+        import subprocess as _sp
+        import time as _t
+
+        cflared = ensure_local_cloudflared()
+        # 1-3. 建/复用 tunnel + 配 ingress + DNS CNAME (REST API, 非交互)
+        tunnel_id, run_token = _cf_get_or_create_tunnel(cfg)
+        if not run_token:
+            raise RuntimeError(
+                f"无法从 Cloudflare API 拿到 tunnel {cfg['tunnel_name']!r} 的运行 token。"
+                f"确认 CLOUDFLARE_API_TOKEN 有 'Cloudflare Tunnel' 写权限。")
+        _cf_put_ingress(cfg, tunnel_id, local_port)
+        _cf_ensure_dns_cname(cfg, tunnel_id)
+
+        # 4. 本地常驻 cloudflared, 拨隧道
+        proc = _sp.Popen(
+            [str(cflared), "tunnel", "run", "--token", run_token],
+            stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        public_url = f"https://{cfg['hostname']}"
+
+        # 自检: 沙箱 curl 公网 URL (DNS 传播 + 边缘生效要几秒)
+        ready = False
+        for _ in range(20):
+            if proc.poll() is not None:
+                err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                raise RuntimeError(f"cloudflared named tunnel 退出 (rc={proc.returncode}): {err[:300]}")
+            r = self.run(
+                f"curl -sS -m 8 -o /dev/null -w 'HTTP%{{http_code}}' {public_url}/ 2>/dev/null || true",
+                timeout=20,
+            )
+            out = (r.get("stdout", "") if r else "")
+            if "HTTP" in out and "HTTP000" not in out:
+                ready = True
+                break
+            _t.sleep(2)
+        if not ready:
+            proc.terminate()
+            raise RuntimeError(
+                f"cloudflared named tunnel {public_url} 在 40s 内未被沙箱访问通; "
+                f"DNS/边缘可能还在传播。")
+
+        from managed_e2b.models import PortForward
+        return PortForward(
+            port=local_port, host=cfg["hostname"], url=public_url, sandbox_id=self.sid,
         )
 
-        # 2. 配置 sshd + 注入公钥
-        self.run('sudo sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config')
-        self.run('sudo sed -i "s/#PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config')
-        self.run("sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh")
+    def _cf_quick_tunnel(self, local_port: int) -> "PortForward":
+        """quick tunnel: 无 key, 随机 trycloudflare URL。见 expose_local_cloudflare。"""
+        import subprocess as _sp
+        import time as _t
 
-        key_path = _pl.Path(ssh_key) if ssh_key else _pl.Path.home() / ".ssh/id_e2b"
-        if not key_path.exists():
-            # Generate key pair
-            _sp.run(["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-q"],
-                   capture_output=True)
-        pubkey = key_path.with_suffix(".pub").read_text().strip()
-        self.run(f'echo "{pubkey}" | sudo tee /root/.ssh/authorized_keys')
-        self.run("sudo chmod 600 /root/.ssh/authorized_keys")
-        self.run("sudo ssh-keygen -A 2>&1 | tail -1")
-        self.run("sudo /usr/sbin/sshd")
+        cflared = ensure_local_cloudflared()
+        proc = _sp.Popen(
+            [str(cflared), "tunnel", "--url", f"http://localhost:{local_port}"],
+            stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        public_url: str | None = None
+        deadline = _t.time() + 30
+        import threading as _th
+        stderr_lines: list[str] = []
+        def _drain():
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_lines.append(line.decode(errors="replace"))
+        _th.Thread(target=_drain, daemon=True).start()
+        while _t.time() < deadline:
+            joined = "".join(stderr_lines)
+            public_url = parse_cloudflared_quick_url(joined)
+            if public_url:
+                break
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"cloudflared quick tunnel 退出 (rc={proc.returncode})。"
+                    f"stderr: {joined[:400]}"
+                )
+            _t.sleep(0.5)
+        if not public_url:
+            proc.terminate()
+            raise RuntimeError(
+                f"cloudflared 30s 内没拿到 trycloudflare URL。"
+                f"stderr: {''.join(stderr_lines)[:400]}"
+            )
 
-        # 3. 启动 websocat bridge: WS 8081 → SSH 22
+        # 等隧道真正可联通 (trycloudflare 侧配 DNS/边缘节点要几秒)
+        ready = False
+        for _ in range(20):
+            r = self.run(
+                f"curl -sS -m 8 -o /dev/null -w 'HTTP%{{http_code}}' {public_url}/ 2>/dev/null || true",
+                timeout=20,
+            )
+            out = (r.get("stdout", "") if r else "")
+            if "HTTP" in out and "HTTP000" not in out:
+                ready = True
+                break
+            _t.sleep(2)
+        if not ready:
+            proc.terminate()
+            raise RuntimeError(
+                f"cloudflared 公网 URL {public_url} 在 40s 内未被沙箱访问通; "
+                f"隧道可能没建好或沙箱无公网访问。"
+            )
+
+        from managed_e2b.models import PortForward
+        host = public_url[len("https://"):] if public_url.startswith("https://") else public_url
+        return PortForward(
+            port=local_port, host=host, url=public_url, sandbox_id=self.sid,
+        )
+
+    def _expose_local_chisel(
+        self, local_port: int, sandbox_port: int, *,
+        chisel_port: int = 8082, chisel_token: str | None = None,
+    ) -> "PortForward":
+        """chisel 反向隧道 (expose_local 的唯一实现, issue #2 的成熟方案)。
+
+        沙箱侧: 下载 chisel linux 二进制, 后台跑 ``chisel server --reverse --port
+        chisel_port --auth e2b:<token>``; 暴露 chisel_port。
+        本地侧: ensure_local_chisel() 拿到本地 chisel client, 后台跑
+        ``chisel client --auth e2b:<token> wss://<host> R:127.0.0.1:<sandbox_port>:127.0.0.1:<local_port>``。
+        自检: 沙箱内 curl sandbox_port 必须命中本地。
+        """
+        import subprocess as _sp
+        import secrets as _sec
+
+        token = chisel_token or _sec.token_hex(16)
+
+        # 1. 沙箱内下载 + 启动 chisel server (--reverse 允许客户端提反向隧道)
         self.run(
-            "nohup sudo websocat -b --exit-on-eof ws-l:0.0.0.0:8081 "
-            "tcp:127.0.0.1:22 > /tmp/websocat.log 2>&1 & echo PID=$!",
+            "set -e; "
+            "mkdir -p /root/bin && cd /root/bin; "
+            "if ! [ -x ./chisel ]; then "
+            "  curl -sL https://github.com/jpillora/chisel/releases/download/"
+            f"v{_CHISEL_VERSION}/chisel_{_CHISEL_VERSION}_linux_amd64.gz -o chisel.gz && "
+            "  gunzip -f chisel.gz && chmod +x chisel; "
+            "fi",
+            timeout=60,
+        )
+        self.run(
+            f"nohup /root/bin/chisel server --reverse --port {chisel_port} "
+            f"--auth e2b:{token} > /tmp/chisel_server.log 2>&1 & echo PID=$!",
             timeout=5,
         )
         import time as _t; _t.sleep(2)
 
-        # 4. 暴露 8081 端口
-        self.expose_port(8081)
-        wss_host = self.get_host(8081)
-        wss_url = f"wss://{wss_host}"
+        # 2. 暴露 chisel_port (E2B 网关 TLS 终结 → 本地拨 wss://)
+        self.expose_port(chisel_port)
+        chisel_host = self.get_host(chisel_port)
+        server_url = f"wss://{chisel_host}"
 
-        # 5. 本地建立 SSH -R 反向隧道 (Popen, 不等 — SSH -N 保持连接)
-        # 不用 -f: Windows 下 -f + ProxyCommand + capture_output 会 hang
-        ssh_cmd = [
-            "ssh",
-            "-i", str(key_path),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ConnectTimeout=15",
-            "-o", f"ProxyCommand=websocat --binary -B 65536 - {wss_url}",
-            "-R", f"127.0.0.1:{sandbox_port}:127.0.0.1:{local_port}",
-            "-N",
-            f"{ssh_user}@{self.sid}",
+        # 3. 本地确保有 chisel client (下载到缓存; 杀软拦截会在这抛带引导的错)
+        local_chisel = ensure_local_chisel()
+
+        # 4. 本地后台启动 chisel client, 建 R: 反向隧道
+        #    R:<sandbox 侧监听 iface>:<sandbox 侧监听 port>:<本地目标 host>:<本地目标 port>
+        client_cmd = [
+            str(local_chisel), "client",
+            "--auth", f"e2b:{token}",
+            server_url,
+            f"R:127.0.0.1:{sandbox_port}:127.0.0.1:{local_port}",
         ]
-        tunnel_proc = _sp.Popen(
-            ssh_cmd, stdin=_sp.DEVNULL,
+        client_proc = _sp.Popen(
+            client_cmd, stdin=_sp.DEVNULL,
             stdout=_sp.PIPE, stderr=_sp.PIPE,
         )
-        # Wait for tunnel to establish (ExitOnForwardFailure means ssh exits
-        # immediately if the -R fails). Give it 5s to connect.
-        import time as _t2
-        _t2.sleep(5)
-        if tunnel_proc.poll() is not None:
-            # Process already exited — tunnel failed
-            err = tunnel_proc.stderr.read().decode(errors="replace")
-            raise RuntimeError(f"SSH reverse tunnel failed: {err[:300]}")
+        import time as _t2; _t2.sleep(3)
+        if client_proc.poll() is not None:
+            err = client_proc.stderr.read().decode(errors="replace")
+            if "not recognized" in err or "Access is denied" in err or not err:
+                raise RuntimeError(
+                    f"chisel client 启动失败 (rc={client_proc.returncode})。"
+                    f"很可能是杀软隔离了 {local_chisel}。请把它加入杀软白名单后重试。"
+                    f"stderr: {err[:300]}"
+                )
+            raise RuntimeError(f"chisel client failed to start: {err[:300]}")
+
+        # 5. 自检: 沙箱内 curl sandbox_port 必须能命中本地 (隧道双向建立)
+        probe_ok = False
+        import time as _t3
+        for _ in range(10):
+            r = self.run(
+                f"curl -sS -m 5 -o /dev/null -w 'HTTP%{{http_code}}' "
+                f"http://127.0.0.1:{sandbox_port}/ -X POST -d '{{}}' 2>/dev/null || true",
+                timeout=15,
+            )
+            out = (r.get("stdout", "") if r else "")
+            if "HTTP" in out and "HTTP000" not in out:
+                probe_ok = True
+                break
+            _t3.sleep(1)
+        if not probe_ok:
+            log = self.run("tail -20 /tmp/chisel_server.log 2>&1", timeout=10)
+            raise RuntimeError(
+                f"chisel 隧道自检失败 (沙箱 127.0.0.1:{sandbox_port} 在 10s 内未把"
+                f"探测流量送到本地 :{local_port})。sandbox chisel 日志: "
+                f"{(log['stdout'] if log else '')[:300]}"
+            )
 
         from managed_e2b.models import PortForward
         return PortForward(

@@ -1,10 +1,10 @@
-"""Additional tests for tunnel_local_http and ssh_reverse_tunnel_cmd."""
+"""Tests for tunnel_local_http (cloudflared) + expose_local (chisel)."""
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 
 
 class TestTunnelLocalHttp:
-    """Test tunnel_local_http and ssh_reverse_tunnel_cmd (sync)."""
+    """Test tunnel_local_http + expose_local→chisel routing (sync)."""
 
     def _make_handle(self, sandbox_id="sbx_test123", sandbox_domain="e2b.app"):
         from managed_e2b.core import SandboxHandle, SandboxLifecycle, SandboxDB
@@ -50,24 +50,72 @@ class TestTunnelLocalHttp:
         assert result["alias"] == "local-api"
         assert result["sandbox_host"] == "abc.trycloudflare.com"
 
-    def test_ssh_reverse_tunnel_cmd(self):
+    def test_expose_local_dispatches_to_chisel(self, monkeypatch):
+        """expose_local routes to _expose_local_chisel with the right args
+        (issue #2: chisel is the only transport now)."""
         h, sandbox = self._make_handle()
-        cmd = h.ssh_reverse_tunnel_cmd(8000)
-        assert "ssh -N -f" in cmd
-        assert "ExitOnForwardFailure=yes" in cmd
-        assert "websocat" in cmd
-        assert "127.0.0.1:9000:127.0.0.1:8000" in cmd
-        assert "user@" in cmd
-        assert h.sid in cmd
+        called = {}
+        def fake_chisel(self_, local_port, sandbox_port, *, chisel_port, chisel_token):
+            called["chisel"] = (local_port, sandbox_port, chisel_port, chisel_token)
+            from managed_e2b.models import PortForward
+            return PortForward(port=sandbox_port, host=f"127.0.0.1:{sandbox_port}",
+                               url=f"http://127.0.0.1:{sandbox_port}", sandbox_id=self_.sid)
+        monkeypatch.setattr(
+            "managed_e2b.core.SandboxHandle._expose_local_chisel", fake_chisel)
+        # default call → defaults flow through
+        pf = h.expose_local(18080)
+        assert called["chisel"] == (18080, 18080, 8082, None)
+        assert pf.port == 18080
+        sandbox.commands.run.assert_not_called()
+        # explicit chisel_port + token
+        pf2 = h.expose_local(18080, sandbox_port=19090, chisel_port=9090, chisel_token="tok")
+        assert called["chisel"] == (18080, 19090, 9090, "tok")
+        assert pf2.port == 19090
 
-    def test_ssh_reverse_tunnel_cmd_custom_port(self):
-        h, sandbox = self._make_handle()
-        cmd = h.ssh_reverse_tunnel_cmd(3000, sandbox_port=7000)
-        assert "127.0.0.1:7000:127.0.0.1:3000" in cmd
+
+class TestChiselResolver:
+    """chisel_release_asset: platform/arch → download URL + archive + binname."""
+
+    def test_linux_amd64_gz(self):
+        from managed_e2b.core import chisel_release_asset
+        url, suf, bn = chisel_release_asset("linux", "amd64")
+        assert suf == "gz"
+        assert bn == "chisel"
+        assert url.endswith("chisel_1.11.8_linux_amd64.gz")
+        assert "github.com/jpillora/chisel/releases/download" in url
+
+    def test_windows_amd64_zip(self):
+        from managed_e2b.core import chisel_release_asset
+        url, suf, bn = chisel_release_asset("windows", "amd64")
+        assert suf == "zip"
+        assert bn == "chisel.exe"
+        assert url.endswith("chisel_1.11.8_windows_amd64.zip")
+
+    def test_darwin_arm64_gz(self):
+        from managed_e2b.core import chisel_release_asset
+        url, suf, bn = chisel_release_asset("darwin", "arm64")
+        assert (suf, bn) == ("gz", "chisel")
+        assert url.endswith("chisel_1.11.8_darwin_arm64.gz")
+
+    def test_normalizes_sys_platform_and_machine(self):
+        from managed_e2b.core import chisel_release_asset
+        # win32 + x86_64 → windows/amd64
+        url, suf, bn = chisel_release_asset("win32", "x86_64")
+        assert (suf, bn) == ("zip", "chisel.exe")
+        # cygwin + aarch64 → windows/arm64
+        url, suf, bn = chisel_release_asset("cygwin", "aarch64")
+        assert (suf, bn) == ("zip", "chisel.exe")
+        assert "windows_arm64" in url
+
+    def test_unknown_raises(self):
+        from managed_e2b.core import chisel_release_asset
+        import pytest
+        with pytest.raises(ValueError, match="no chisel release asset"):
+            chisel_release_asset("solaris", "sparc")
 
 
 class TestAsyncTunnelLocalHttp:
-    """Test async tunnel_local_http and ssh_reverse_tunnel_cmd."""
+    """Test async tunnel_local_http."""
 
     def _make_handle(self, sandbox_id="sbx_async456", sandbox_domain="e2b.app"):
         from managed_e2b.async_core import AsyncSandboxHandle, AsyncSandboxLifecycle
@@ -106,9 +154,3 @@ class TestAsyncTunnelLocalHttp:
         result = await h.tunnel_local_http("https://abc.trycloudflare.com")
         assert result["sandbox_host"] == "abc.trycloudflare.com"
 
-    def test_async_ssh_reverse_tunnel_cmd(self):
-        h, sandbox = self._make_handle()
-        cmd = h.ssh_reverse_tunnel_cmd(8000)
-        assert "ssh -N -f" in cmd
-        assert "websocat" in cmd
-        assert "127.0.0.1:9000:127.0.0.1:8000" in cmd
