@@ -44,18 +44,16 @@ from typing import Optional
 logger = logging.getLogger("sandbox_lifecycle")
 
 
-# ---------------- 二进制缓存: chisel + cloudflared 共用的下载/解压/冒烟管线 ----------------
-# 两个工具 (chisel = 沙箱→本地反向隧道; cloudflared = 本地→公网 quick/named tunnel)
-# 都要从 GitHub release 下一个单二进制到本地缓存、按 archive 后缀解压、smoke-test --version,
-# 且都可能被杀软拦 (chisel.exe 高误报)。下面的通用管线把差异收口到一个 asset 解析器 +
-# 一个解压回调, 避免两份几乎相同的 ~60 行实现 (之前还 arch 映射漂移: armv7l→armv5 vs arm)。
+# ---------------- 二进制缓存: GitHub release 单二进制的下载/解压/冒烟管线 ----------------
+# chisel (及其它可能的单二进制工具) 都要从 GitHub release 下一个二进制到本地缓存、按 archive
+# 后缀解压、smoke-test --version, 且都可能被杀软拦 (chisel.exe 高误报)。下面的通用管线把差异
+# 收口到一个 asset 解析器 + 一个解压回调。
 
 def _normalize_platform_arch(platform: str, arch: str) -> tuple[str, str]:
     """归一化平台 + 通用 arch 别名 (x86_64→amd64, aarch64→arm64, i386/i686→386)。
 
-    ARM 细分 (armv7l/armv6l → 各工具自己的 release arch: chisel=armv5, cloudflared=arm/armhf)
-    不在这里统一, 留给各工具的 asset 表, 因为两个 release 的 ARM 命名不同 (cloudflared 是
-    linux-arm / linux-armhf; chisel 是 linux_armv5), 强行统一会下到不存在的资产。
+    ARM 细分 (armv7l/armv6l → 各工具自己的 release arch, 如 chisel=armv5) 不在这里统一,
+    留给各工具的 asset 表, 因为不同 release 的 ARM 命名不同, 强行统一会下到不存在的资产。
     """
     p = platform.lower()
     if p in ("win32", "cygwin", "msys"):
@@ -90,7 +88,7 @@ def _extract_release_archive(suffix: str, archive_path, bin_path, cache_dir, bin
             z.extract(binname, cache_dir)
     elif suffix == "tgz":
         with tarfile.open(archive_path, "r:gz") as tf:
-            # cloudflared 的 tar 里二进制就叫 binname (无目录前缀的情况也按 basename 兜一下)
+            # tar 里二进制可能就叫 binname, 也可能有目录前缀, 按 basename 兜一下。
             member = next((m for m in tf.getmembers()
                            if _o.path.basename(m.name) == binname), None)
             if member is None:
@@ -185,7 +183,7 @@ _CHISEL_ASSETS = {
 def chisel_release_asset(platform: str, arch: str) -> tuple[str, str, str]:
     """(download_url, archive_suffix, binary_name)。纯函数, 不联网。"""
     p, a = _normalize_platform_arch(platform, arch)
-    # chisel 的 ARM 细分命名 (armv7l→armv5); 与 cloudflared 不同, 见 _normalize_platform_arch。
+    # chisel 的 ARM 细分命名 (armv7l→armv5); 见 _normalize_platform_arch 注释。
     if a in ("armv7l", "armv6l"):
         a = "armv5"
     key = (p, a)
@@ -207,256 +205,6 @@ def ensure_local_chisel():
         cache_subdir="chisel", label="chisel", smoke_timeout=10,
     )
 
-
-# ---------------- cloudflared (本地→公网, quick + named tunnel) ----------------
-# cloudflared (cloudflare/cloudflared): Cloudflare 官方签名二进制, 杀软基本不拦。
-# 本地→公网 方向 —— 本地跑 quick tunnel 拿 trycloudflare.com 公网 URL, 或用 API token
-# 走 named tunnel 绑自己的域名 (URL 稳定)。代价: 本地服务暴露到公网 (见 expose_local_cloudflare)。
-# release: cloudflared-<os>-<arch>[.tgz|.exe]  (linux→裸; darwin→tgz; windows→exe)
-
-_CFLARED_VERSION = "2026.7.3"
-_CFLARED_REPO = "cloudflare/cloudflared"
-
-# (archive_suffix|None, binary_name) per normalized (os, arch); None = 裸二进制直接下
-# cloudflared 的 ARM release 叫 arm / armhf (不是 armv5/armv7)
-_CFLARED_ASSETS = {
-    ("linux", "amd64"): (None, "cloudflared"), ("linux", "386"): (None, "cloudflared"),
-    ("linux", "arm64"): (None, "cloudflared"), ("linux", "arm"): (None, "cloudflared"),
-    ("linux", "armhf"): (None, "cloudflared"),
-    ("darwin", "amd64"): ("tgz", "cloudflared"), ("darwin", "arm64"): ("tgz", "cloudflared"),
-    ("windows", "amd64"): ("exe", "cloudflared.exe"),
-    ("windows", "386"): ("exe", "cloudflared.exe"),
-    ("windows", "arm64"): ("exe", "cloudflared.exe"),
-}
-
-
-def cloudflared_release_asset(platform: str, arch: str) -> tuple[str, str, str]:
-    """(download_url, archive_suffix|None, binary_name)。纯函数, 不联网。"""
-    p, a = _normalize_platform_arch(platform, arch)
-    # cloudflared 的 ARM 细分命名 (armv7l→arm, armv6l→armhf); 与 chisel 不同。
-    a = {"armv7l": "arm", "armv6l": "armhf"}.get(a, a)
-    key = (p, a)
-    if key not in _CFLARED_ASSETS:
-        raise ValueError(
-            f"no cloudflared release asset for platform={platform!r} arch={arch!r} "
-            f"(normalized {key}); supported: {sorted(_CFLARED_ASSETS)}")
-    suffix, binname = _CFLARED_ASSETS[key]
-    # None → 裸文件名 (cloudflared-linux-amd64); exe/tgz → 加后缀
-    asset = f"cloudflared-{p}-{a}" if suffix is None else f"cloudflared-{p}-{a}.{suffix}"
-    url = (f"https://github.com/{_CFLARED_REPO}/releases/download/"
-           f"{_CFLARED_VERSION}/{asset}")
-    return url, suffix, binname
-
-
-def ensure_local_cloudflared():
-    """本地有 cloudflared 二进制则返回, 否则下载到 ~/.cache/managed_e2b/cloudflared/。"""
-    return ensure_cached_binary(
-        resolver=lambda pf, ar: cloudflared_release_asset(pf, ar),
-        cache_subdir="cloudflared", label="cloudflared", smoke_timeout=15,
-    )
-
-
-def parse_cloudflared_quick_url(stderr_text: str) -> str | None:
-    """从 cloudflared quick tunnel 的 stderr 里解析 trycloudflare.com 公网 URL。
-
-    cloudflared 把 URL 打成两行 (Visit it at: ... | https://xxx.trycloudflare.com |),
-    这里直接抓 https://<...>.trycloudflare.com 即可。抓不到返回 None。
-    """
-    import re
-    m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", stderr_text)
-    return m.group(0) if m else None
-
-
-class StderrTail:
-    """后台线程把一个进程的 stderr 边读边收进有界 deque, 避免无限增长 + pipe 堵塞。
-
-    之前 quick tunnel 用闭包 `_drain` + 无界 list: 既 O(n²) (循环里 "".join 全量重扫),
-    又把整个外层 frame 钉在内存里 (闭包捕获 proc/deadline 等); named tunnel 干脆没
-    drain, cloudflared 日志一多就堵 stderr pipe (~64KB) 卡死隧道。本类只持 proc.stderr
-    + 一个 maxlen deque, 每行可触发回调 (如 quick tunnel 在行里抓 URL), 不钉外层作用域。
-    """
-
-    def __init__(self, proc_stderr, *, maxlen: int = 200, on_line=None):
-        import collections, threading
-        self._buf = collections.deque(maxlen=maxlen)
-        self._on_line = on_line
-        self._thread = threading.Thread(target=self._run, args=(proc_stderr,), daemon=True)
-        self._thread.start()
-
-    def _run(self, proc_stderr):
-        if proc_stderr is None:
-            return  # 进程没开 stderr (理论上不会, 防御)
-        for raw in proc_stderr:
-            line = raw.decode(errors="replace")
-            self._buf.append(line)
-            if self._on_line is not None:
-                try:
-                    self._on_line(line)
-                except Exception:
-                    pass  # 回调失败不影响 drain
-
-    def text(self) -> str:
-        return "".join(self._buf)
-
-
-# ---------------- cloudflared named tunnel (API token 模式, 稳定域名) ----------------
-# 与 quick tunnel 不同: 用 CLOUDFLARE_API_TOKEN 走 REST API 建一个命名 tunnel 并绑到你
-# 自己的域名 (如 adapter.yourdomain.com), URL 稳定可复用。流程 (全程非交互, 只靠环境变量):
-#   1. POST   /accounts/{aid}/cfd_tunnel            {name, config_src:"cloudflare"}
-#      → 返回 {id, token} (tunnel 已建)
-#   2. PUT    /accounts/{aid}/cfd_tunnel/{id}/configurations
-#      {config:{ingress:[{hostname, service:http://localhost:port}, {service:http_status:404}]}}
-#   3. POST   /zones/{zid}/dns_records
-#      {type:"CNAME", name:<hostname>, content:"<id>.cfargotunnel.com", proxied:true}
-#   4. cloudflared tunnel run --token <token>      (本地常驻进程)
-# 沙箱直接访问 https://<hostname> → 经 Cloudflare 边缘 → 本地 local_port。
-# tunnel 复用: 同 (account, tunnel_name) 的 tunnel 已存在就 GET 列表里取, 不重建。
-
-def _cf_named_env() -> dict | None:
-    """读 named-tunnel 所需环境变量。齐全返回 dict, 否则 None (走 quick tunnel)。"""
-    import os as _o
-    token = _o.environ.get("CLOUDFLARE_API_TOKEN")
-    account = _o.environ.get("CLOUDFLARE_ACCOUNT_ID")
-    zone_name = _o.environ.get("CLOUDFLARE_ZONE_NAME")  # 如 yourdomain.com
-    hostname = _o.environ.get("CLOUDFLARE_TUNNEL_HOSTNAME")  # 如 adapter.yourdomain.com
-    if not (token and account and zone_name and hostname):
-        return None
-    return {
-        "token": token, "account_id": account, "zone_name": zone_name,
-        "hostname": hostname,
-        "tunnel_name": _o.environ.get("CLOUDFLARE_TUNNEL_NAME", "managed-e2b"),
-    }
-
-
-def _cf_api(method: str, path: str, cfg: dict, *, json_body: dict | None = None):
-    """调 Cloudflare REST API (api.cloudflare.com), 返回 JSON ``result`` (list|dict|str)。
-
-    失败 (success=false 或 HTTP 错) 抛 RuntimeError。直接返回 result 原样, 不再 coerce 成 {},
-    这样列表/字符串 result 能原样到达调用方 —— 之前的调用方各自 isinstance 重解包是因为
-    旧 _cf_api 把 falsy result 变成了 {}。
-    """
-    import json as _j
-    import urllib.request as _ur
-    import urllib.error as _ue
-    url = f"https://api.cloudflare.com/client/v4{path}"
-    data = _j.dumps(json_body).encode() if json_body is not None else None
-    req = _ur.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {cfg['token']}",
-        "Content-Type": "application/json",
-    })
-    try:
-        with _ur.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode()
-    except _ue.HTTPError as e:
-        body = e.read().decode(errors="replace")[:400]
-        raise RuntimeError(f"Cloudflare API {method} {path} → HTTP {e.code}: {body}") from e
-    payload = _j.loads(raw)
-    if not payload.get("success", False):
-        errs = payload.get("errors") or payload.get("messages") or []
-        raise RuntimeError(f"Cloudflare API {method} {path} failed: {errs}")
-    return payload.get("result")
-
-
-def _cf_zone_id(cfg: dict) -> str:
-    """查 zone id (按 zone_name)。带缓存 (一个 zone 名只查一次)。"""
-    cache = _cf_named_state.setdefault("zone_ids", {})
-    if cfg["zone_name"] in cache:
-        return cache[cfg["zone_name"]]
-    zones = _cf_api("GET", f"/zones?name={cfg['zone_name']}", cfg) or []
-    if not zones:
-        raise RuntimeError(f"Cloudflare zone {cfg['zone_name']!r} 未找到 (查 /zones?name=)")
-    zid = zones[0]["id"]
-    cache[cfg["zone_name"]] = zid
-    return zid
-
-
-# named tunnel 跨调用缓存: {(account, tunnel_name): {"tunnel_id","token"}}
-_cf_named_state: dict = {}
-
-# WARP 路由预检缓存: 进程生命周期内路由表基本不变, 缓存 powershell 查询结果 (None=未查)。
-_warp_route_cache: str | None = None
-
-
-def _cf_tunnel_token(cfg: dict, tunnel_id: str) -> str:
-    """GET tunnel run token。token 端点返回的 result 可能是 str, 也可能被旧版包成 {result:"..."}。
-
-    集中在这里处理那个 shape 不一致, 不在每个调用方重复 isinstance 解包。
-    """
-    token = _cf_api("GET", f"/accounts/{cfg['account_id']}/cfd_tunnel/{tunnel_id}/token", cfg)
-    if isinstance(token, dict):
-        token = token.get("result") or token.get("token") or ""
-    return token or ""
-
-
-def _cf_get_or_create_tunnel(cfg: dict) -> tuple[str, str]:
-    """复用或新建命名 tunnel, 返回 (tunnel_id, run_token)。
-
-    优先从 _cf_named_state 缓存取 (同进程多次 expose 复用); 没有就列表查同名 tunnel;
-    再没有就 POST 新建。token: 新建时用返回的 token, 否则走 _cf_tunnel_token 单独 GET。
-    缓存只在末尾写一处。
-    """
-    key = (cfg["account_id"], cfg["tunnel_name"])
-    if key in _cf_named_state:
-        c = _cf_named_state[key]
-        return c["tunnel_id"], c["token"]
-
-    base = f"/accounts/{cfg['account_id']}/cfd_tunnel"
-    existing = _cf_api("GET", f"{base}?name={cfg['tunnel_name']}", cfg) or []
-    if existing:
-        tid = existing[0]["id"]
-        token = _cf_tunnel_token(cfg, tid)
-    else:
-        r = _cf_api("POST", base, cfg, json_body={
-            "name": cfg["tunnel_name"], "config_src": "cloudflare",
-        })
-        tid = r["id"]
-        token = r.get("token") or _cf_tunnel_token(cfg, tid)
-
-    _cf_named_state[key] = {"tunnel_id": tid, "token": token}
-    return tid, token
-
-
-def _cf_put_ingress(cfg: dict, tunnel_id: str, local_port: int) -> None:
-    """PUT tunnel ingress 配置: hostname → http://localhost:port, 兜底 404。"""
-    body = {
-        "config": {
-            "ingress": [
-                {"hostname": cfg["hostname"], "service": f"http://localhost:{local_port}"},
-                {"service": "http_status:404"},  # 必须的 terminating catch-all
-            ]
-        }
-    }
-    _cf_api("PUT", f"/accounts/{cfg['account_id']}/cfd_tunnel/{tunnel_id}/configurations",
-            cfg, json_body=body)
-
-
-def _cf_ensure_dns_cname(cfg: dict, tunnel_id: str) -> None:
-    """确保 DNS CNAME: {hostname} → {tunnel_id}.cfargotunnel.com (proxied)。已存在则跳过。
-
-    DNS 权限缺失 (HTTP 403 / code 10000) 不致命: token 可能只给了 Tunnel 权限而没给
-    Zone:DNS:Edit。这时打 warning 给出需手动绑的 CNAME target, 然后继续 —— cloudflared
-    仍会 run, 用户手动在 Cloudflare 面板绑好 CNAME 后沙箱即可访问。
-    """
-    zid = _cf_zone_id(cfg)
-    target = f"{tunnel_id}.cfargotunnel.com"
-    try:
-        recs = _cf_api("GET", f"/zones/{zid}/dns_records?name={cfg['hostname']}", cfg) or []
-        for r in recs:
-            if r.get("type") == "CNAME" and r.get("content") == target:
-                return  # 已存在, 跳过
-        _cf_api("POST", f"/zones/{zid}/dns_records", cfg, json_body={
-            "type": "CNAME", "name": cfg["hostname"], "content": target, "proxied": True,
-        })
-    except RuntimeError as e:
-        msg = str(e)
-        if "403" in msg or "10000" in msg or "Authentication error" in msg:
-            logger.warning(
-                f"cloudflared named tunnel: token 无 Zone:DNS 权限, 无法自动绑 CNAME。"
-                f"请手动在 Cloudflare DNS 给 {cfg['hostname']} 绑一条 CNAME → {target} "
-                f"(proxied 开)。绑好后沙箱即可访问 https://{cfg['hostname']}。"
-                f"(原始错误: {msg[:160]})")
-            return
-        raise  # 其它错 (网络/5xx/参数) 仍抛
 
 
 # ---------------- sqlite 真相源 ----------------
@@ -988,54 +736,6 @@ class SandboxHandle:
         return self._expose_local_chisel(
             local_port, sandbox_port, chisel_port=chisel_port, chisel_token=chisel_token)
 
-    def expose_local_cloudflare(self, local_port: int) -> "PortForward":
-        """用 cloudflared 把本地服务暴露到一个公网 URL, 沙箱直接访问该 URL 即命中本地。
-
-        与 expose_local (chisel, 沙箱内走 127.0.0.1:port) **方向不同**: cloudflared 是
-        本地→公网 —— 本地跑 cloudflared 拿一个公网 URL, 沙箱 curl 该 URL 到达本地。
-        优点: cloudflared 是 Cloudflare 官方签名二进制, 杀软基本不拦; 不需要沙箱侧装
-        任何东西 (沙箱直接访问公网 URL)。
-
-        两种模式 (按环境变量自动选):
-
-        - **named tunnel** (有 key 时, 稳定域名): 设了以下 4 个环境变量就走它 ——
-          ``CLOUDFLARE_API_TOKEN`` + ``CLOUDFLARE_ACCOUNT_ID`` +
-          ``CLOUDFLARE_ZONE_NAME`` (如 yourdomain.com) +
-          ``CLOUDFLARE_TUNNEL_HOSTNAME`` (如 adapter.yourdomain.com)。
-          可选 ``CLOUDFLARE_TUNNEL_NAME`` (默认 "managed-e2b")。
-          用 REST API 建/复用命名 tunnel、配 ingress (hostname → localhost:port)、
-          建 DNS CNAME, 再本地 ``cloudflared tunnel run --token <token>``。
-          URL 稳定不变, 进程重启后复用; 适合长期/反复评测。代价: 本地服务暴露到公网
-          (建议在适配器侧加 token auth, 如 anyharness 的 ADAPTER_AUTH)。
-
-        - **quick tunnel** (默认, 无 key): ``cloudflared tunnel --url http://localhost:port``,
-          拿一个随机 trycloudflare.com URL。URL 每次随机、无 auth 裸奔, 仅适合临时/
-          可信环境, 用完即停。
-
-        本地需能从 github.com 下载 cloudflared 二进制; 沙箱需能访问公网 (E2B 默认允许)。
-
-        Args:
-            local_port: 本地要暴露的端口号 (如 18080 = anyharness adapter)
-
-        Returns:
-            PortForward: host/url 是公网地址 (沙箱直接访问); port 字段填 local_port
-            仅供记录, 沙箱访问用的是 url。
-        """
-        cfg = _cf_named_env()
-        if cfg is not None:
-            return self._cf_named_tunnel(local_port, cfg)
-        # 无 key → quick tunnel。issue #6: 它在真实 agent 负载 (claude keep-alive + 大 body)
-        # 下不稳, 边缘→origin 连接会断 → HTTP 530 / tunnel_error 1033; 这里 warn 引导用
-        # named tunnel (设下面 4 个环境变量) 拿稳定域名。持续自检 (_probe_url_sustained)
-        # 能更早暴露 flaky, 但 trycloudflare 本质不可靠, 无法靠自检根治。
-        logger.warning(
-            "expose_local_cloudflare: 未设 CLOUDFLARE_API_TOKEN 等, 走 quick tunnel "
-            "(随机 trycloudflare URL)。它无 auth 且在真实 agent 负载 (claude keep-alive "
-            "+ 大 body) 下可能 HTTP 530 / tunnel_error 1033 (issue #6)。跑真实任务请设 "
-            "CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_ZONE_NAME + "
-            "CLOUDFLARE_TUNNEL_HOSTNAME 走 named tunnel (稳定域名)。")
-        return self._cf_quick_tunnel(local_port)
-
     @staticmethod
     def _http_probe_ok(out: str) -> bool:
         """沙箱 curl 的 stdout 是否表示"隧道通"。
@@ -1085,8 +785,7 @@ class SandboxHandle:
         if need > 1:
             raise RuntimeError(
                 f"{fail_msg}: 在 {deadline_s}s 内未连续 {need} 次探到非 000/非 530 响应 "
-                f"(最后一次: {last_out[:60]!r})。trycloudflare quick tunnel 的边缘连接不稳, "
-                f"真实 agent 负载下会 530; 建议设 CLOUDFLARE_API_TOKEN 等走 named tunnel。")
+                f"(最后一次: {last_out[:60]!r})。隧道边缘连接不稳, 真实负载下可能 530。")
         raise RuntimeError(fail_msg)
 
     # 旧名保留为薄包装, 兼容已有调用/测试。
@@ -1099,229 +798,6 @@ class SandboxHandle:
         """sustained 自检 (need>1, 默认 3)。新代码直接用 _probe_url(need=3)。"""
         self._probe_url(url, need=need, **kw)
 
-
-    @staticmethod
-    def _wait_ha_connections(metrics_url: str, *, deadline_s: int = 30,
-                              poll_s: float = 0.5) -> None:
-        """轮询 cloudflared 的 --metrics 端点, 等 ``cloudflared_tunnel_ha_connections >= 1``
-        再返回 —— 即 cloudflared 已向 Cloudflare 边缘注册了 HA (QUIC) 连接。
-
-        issue #6 的根本修法: 530/tunnel_error 1033 的成因是 cloudflared→边缘的连接没建好
-        (ha_connections=0), 而旧的 URL 自检探的是"边缘是否路由到 origin", 它能在 cloudflared
-        还没注册时蹭到假连通窗口, 返回一个马上就死的 URL。先等 ha_connections≥1 (本地 HTTP 查,
-        秒级、不耗公网) 再做 URL 自检, 从根上消除了假阳性。超时抛 RuntimeError。
-        """
-        import time as _t
-        import urllib.request as _ur
-        import re as _re
-        deadline = _t.time() + deadline_s
-        last = ""
-        while _t.time() < deadline:
-            try:
-                with _ur.urlopen(metrics_url, timeout=2) as resp:
-                    last = resp.read().decode(errors="replace")
-                m = _re.search(r"^cloudflared_tunnel_ha_connections\s+(\d+)", last, _re.M)
-                if m and int(m.group(1)) >= 1:
-                    return
-            except OSError:
-                pass  # metrics 还没起 / cloudflared 没开 --metrics
-            _t.sleep(poll_s)
-        raise RuntimeError(
-            f"cloudflared 在 {deadline_s}s 内未建立到边缘的 HA 连接 "
-            f"(cloudflared_tunnel_ha_connections 一直为 0)。metrics: {metrics_url}。"
-            f"last metrics: {last[:200]!r}")
-
-    @staticmethod
-    def _warp_remediation_hint() -> str:
-        """WARP/VPN 抢边缘路由的统一修复建议 (预检 + 失败诊断共用, 避免两处文案漂移)。"""
-        return (
-            "cloudflared 出站连 Cloudflare 边缘会走该虚拟网卡并与之抢路由, 导致隧道 530/连不上。"
-            "请先关掉 WARP/VPN, 或在 WARP 的 Split Tunnel 设置里排除 Cloudflare 边缘 IP, "
-            "或在 cloudflared 命令加 --protocol http2 走 TCP 443 回退, 再重试。")
-
-    @staticmethod
-    def _cf_edge_diag(stderr_text: str) -> str:
-        """扫 cloudflared stderr, 若发现"连不上边缘"的错误, 返回针对性诊断提示。
-
-        实测场景 (issue #6 真机验证): 本机装了 Cloudflare WARP / 其它 VPN 路由了
-        198.18.0.0/16, 跟 cloudflared 抢边缘路由 → QUIC 拨号 timeout / TLS 握手 EOF,
-        ha_connections gauge 仍报 1 (误导), 但公网 URL 530。这时给清晰诊断, 免得用户
-        以为是代码 bug。无匹配返回空串。
-        """
-        t = stderr_text or ""
-        symptom = ""
-        if "Failed to dial" in t or "no recent network activity" in t:
-            symptom = "cloudflared 拨不上 Cloudflare 边缘 (QUIC/UDP 7844)"
-        elif "TLS handshake with edge" in t:
-            symptom = "cloudflared 到边缘的 TLS 握手失败 (EOF, 也可能出站 443/7844 被防火墙挡)"
-        if not symptom:
-            return ""
-        return "  [诊断] " + symptom + "。常见原因: 本机的 Cloudflare WARP 或 VPN 路由了 " \
-               f"198.18.0.0/16, 跟 cloudflared 抢边缘路由。{SandboxHandle._warp_remediation_hint()}"
-
-    @staticmethod
-    def _warn_if_warp_routes() -> None:
-        """启动 cloudflared 前预检: 本机是否把 198.18.0.0/16 (Cloudflare WARP 虚拟段)
-        路由到了某个网卡。若是, 提前 warning (见 _warp_remediation_hint)。
-
-        代码层面 cloudflared 不支持选源网卡, 所以无法强制绕开 (那是 OS 路由层的事);
-        只能提前检测 + 引导。非 Windows / 查不到路由表则静默跳过。路由表进程生命周期内
-        基本不变, 结果缓存到模块级 _warp_route_cache 避免每次 expose 都 spawn powershell。
-        """
-        global _warp_route_cache
-        if _warp_route_cache is not None:
-            iface = _warp_route_cache
-        else:
-            import sys as _sys
-            if not _sys.platform.startswith("win"):
-                _warp_route_cache = ""  # 非 Windows: 不查, 永久跳过
-                return
-            import subprocess as _sp
-            try:
-                r = _sp.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "Get-NetRoute -DestinationPrefix '198.18.0.0/16' -ErrorAction SilentlyContinue | "
-                     "Select-Object -ExpandProperty InterfaceAlias -Unique"],
-                    capture_output=True, timeout=5, check=False,
-                )
-                iface = r.stdout.decode(errors="replace").strip()
-            except (OSError, _sp.SubprocessError):
-                iface = ""  # 没装 powershell / 沙箱环境
-            _warp_route_cache = iface
-        if iface:
-            logger.warning(
-                f"expose_local_cloudflare: 检测到 198.18.0.0/16 路由走网卡 [{iface.splitlines()[0]}] —— "
-                f"这通常是本机的 Cloudflare WARP 或 VPN 虚拟网卡。"
-                f"{SandboxHandle._warp_remediation_hint()}")
-
-    @staticmethod
-    def _cf_alloc_metrics() -> tuple[int, str]:
-        """选一个本地空闲端口给 cloudflared --metrics, 返回 (port, metrics_url)。
-
-        named/quick 两条隧道都要这套, 抽出来避免 bind+close+url 三行重复 (且 TOCTOU 一处维护)。
-        """
-        import socket as _sock
-        s = _sock.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-        return port, f"http://127.0.0.1:{port}/metrics"
-
-    def _cf_probe_with_diag(self, probe_fn, _tail, **probe_kw) -> None:
-        """跑 URL 自检; 失败时把 _cf_edge_diag 的诊断追加到异常消息里重抛 (无诊断则原样重抛)。
-
-        named/quick 都用这个包装, 避免 try/except/diag/raise 五行样板在两处重复。
-        """
-        try:
-            probe_fn(**probe_kw)
-        except RuntimeError as _e:
-            diag = self._cf_edge_diag(_tail.text())
-            if diag:
-                raise RuntimeError(f"{_e}\n{diag}") from None
-            raise
-
-    def _cf_named_tunnel(self, local_port: int, cfg: dict) -> "PortForward":
-        """named tunnel: API token 建隧道 + 绑定自定义域名, URL 稳定。见 expose_local_cloudflare。"""
-        import subprocess as _sp
-
-        cflared = ensure_local_cloudflared()
-        self._warn_if_warp_routes()  # 预检: WARP/VPN 路由 198.18.0.0/16 会抢边缘路由
-        # 1-3. 建/复用 tunnel + 配 ingress + DNS CNAME (REST API, 非交互)
-        tunnel_id, run_token = _cf_get_or_create_tunnel(cfg)
-        if not run_token:
-            raise RuntimeError(
-                f"无法从 Cloudflare API 拿到 tunnel {cfg['tunnel_name']!r} 的运行 token。"
-                f"确认 CLOUDFLARE_API_TOKEN 有 'Cloudflare Tunnel' 写权限。")
-        _cf_put_ingress(cfg, tunnel_id, local_port)
-        _cf_ensure_dns_cname(cfg, tunnel_id)
-
-        # 4. 本地常驻 cloudflared, 拨隧道; --metrics 查 ha_connections; StderrTail 防 pipe 堵
-        metrics_port, metrics_url = self._cf_alloc_metrics()
-        proc = _sp.Popen(
-            [str(cflared), "tunnel", "--metrics", f"127.0.0.1:{metrics_port}",
-             "run", "--token", run_token],
-            stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.PIPE,
-        )
-        _tail = StderrTail(proc.stderr)
-        public_url = f"https://{cfg['hostname']}"
-
-        # 根本自检: 等 cloudflared 向边缘注册 HA 连接 (ha_connections≥1), 再做 URL 自检。
-        # 与 quick tunnel 同理 (issue #6): 避免 URL 自检蹭假窗口返回死 URL。
-        self._wait_ha_connections(metrics_url, deadline_s=30)
-
-        # 兜底: 沙箱 curl 公网 URL (DNS 传播 + 边缘生效要几秒); 失败追加边缘诊断。
-        self._cf_probe_with_diag(
-            self._probe_url_ready, _tail, url=public_url, proc=proc,
-            fail_msg=f"cloudflared named tunnel {public_url} 在 40s 内未被沙箱访问通; DNS/边缘可能还在传播。"
-            f" stderr: {_tail.text()[:300]}",
-        )
-
-        from managed_e2b.models import PortForward
-        return PortForward(
-            port=local_port, host=cfg["hostname"], url=public_url, sandbox_id=self.sid,
-        )
-
-    def _cf_quick_tunnel(self, local_port: int) -> "PortForward":
-        """quick tunnel: 无 key, 随机 trycloudflare URL。见 expose_local_cloudflare。"""
-        import subprocess as _sp
-        import threading as _th
-
-        cflared = ensure_local_cloudflared()
-        self._warn_if_warp_routes()  # 预检: WARP/VPN 路由 198.18.0.0/16 会抢边缘路由
-        metrics_port, metrics_url = self._cf_alloc_metrics()
-        proc = _sp.Popen(
-            [str(cflared), "tunnel", "--metrics", f"127.0.0.1:{metrics_port}",
-             "--url", f"http://localhost:{local_port}"],
-            stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.PIPE,
-        )
-        # 边读 stderr 边按行抓 trycloudflare URL; StderrTail 有界 deque + 行回调, 不钉外层作用域,
-        # 也不 O(n²) 重扫全量。URL 抓到用 Event 通知。
-        found = _th.Event()
-        holder: dict[str, str | None] = {"url": None}
-        def _on_line(line):
-            if not holder["url"]:
-                u = parse_cloudflared_quick_url(line)
-                if u:
-                    holder["url"] = u
-                    found.set()
-        _tail = StderrTail(proc.stderr, on_line=_on_line)
-
-        # cloudflared 拿 trycloudflare URL 与向边缘注册 HA 连接是并行发生的, 这里也并行等:
-        # HA gate 放后台线程, URL 在主线程等, 都完成 (或任一失败) 才继续。比串行两个 30s 省一半。
-        ha_err: list[Exception] = []
-        def _ha_wait():
-            try:
-                self._wait_ha_connections(metrics_url, deadline_s=30)
-            except RuntimeError as e:
-                ha_err.append(e)
-        ha_thread = _th.Thread(target=_ha_wait, daemon=True)
-        ha_thread.start()
-
-        url_ok = found.wait(timeout=30)
-        if not url_ok and proc.poll() is not None:
-            raise RuntimeError(
-                f"cloudflared quick tunnel 退出 (rc={proc.returncode})。stderr: {_tail.text()[:400]}")
-        if not url_ok:
-            proc.terminate()
-            raise RuntimeError(f"cloudflared 30s 内没拿到 trycloudflare URL。stderr: {_tail.text()[:400]}")
-        public_url = holder["url"]
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"cloudflared quick tunnel 退出 (rc={proc.returncode})。stderr: {_tail.text()[:400]}")
-        ha_thread.join(timeout=30)  # 等 HA gate 完成 (URL 通常先到, HA 还要几秒)
-        if ha_err:
-            proc.terminate()
-            raise ha_err[0]
-
-        # 持续 URL 自检 (need=3): ha_connections≥1 后仍可能短暂 530, 要求连续 3 次通才放行;
-        # 失败追加边缘诊断。这是 issue #6 的兜底 (治本), sustained 探针本身是治标。
-        self._cf_probe_with_diag(
-            self._probe_url_sustained, _tail, url=public_url, proc=proc,
-            need=3, fail_msg=f"cloudflared quick tunnel {public_url} 自检失败",
-        )
-
-        from managed_e2b.models import PortForward
-        host = public_url[len("https://"):] if public_url.startswith("https://") else public_url
-        return PortForward(
-            port=local_port, host=host, url=public_url, sandbox_id=self.sid,
-        )
 
     def _expose_local_chisel(
         self, local_port: int, sandbox_port: int, *,
