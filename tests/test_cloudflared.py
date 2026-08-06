@@ -25,6 +25,9 @@ from managed_e2b.core import (
     parse_cloudflared_quick_url,
 )
 
+# shared test helpers (free_port, FakeProc) from tests/conftest.py
+from conftest import free_port, FakeProc  # type: ignore  # noqa: E402
+
 _CFLARED_BIN = Path.home() / ".cache" / "managed_e2b" / "cloudflared" / (
     "cloudflared.exe" if sys.platform.startswith("win") else "cloudflared"
 )
@@ -189,14 +192,9 @@ class TestNamedTunnelApiShaping:
         # stub _cf_named_state cache so the first branch (no cache) runs
         core._cf_named_state.clear()
 
-        class _FakeProc:
-            def __init__(self): self.returncode = None
-            stderr = None
-            def poll(self): return None
-            def terminate(self): self.returncode = 0
         import managed_e2b.core as c2
         import subprocess
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _FakeProc())
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
         # HA-connection gate hits a real metrics port we don't run here; stub it out.
         monkeypatch.setattr(core.SandboxHandle, "_wait_ha_connections",
                             staticmethod(lambda url, **k: None))
@@ -243,12 +241,8 @@ class TestNamedTunnelApiShaping:
         monkeypatch.setattr(core, "_cf_api", fake_api)
         core._cf_named_state.clear()
 
-        class _P:
-            returncode = None; stderr = None
-            def poll(self): return None
-            def terminate(self): self.returncode = 0
         import subprocess
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _P())
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
         monkeypatch.setattr(core.SandboxHandle, "_wait_ha_connections",
                             staticmethod(lambda url, **k: None))
         monkeypatch.setattr(core.SandboxHandle, "_warn_if_warp_routes",
@@ -293,12 +287,6 @@ class TestSustainedProbe:
         _runner.i = 0
         h.run = MagicMock(side_effect=_runner)
         return h
-
-    class _P:
-        returncode = None
-        stderr = None
-        def poll(self): return None
-        def terminate(self): self.returncode = 0
 
     def test_three_consecutive_200_passes(self):
         h = self._handle_with_probe_outputs(["HTTP200", "HTTP200", "HTTP200"])
@@ -486,7 +474,7 @@ def test_expose_local_cloudflare_e2e(tmp_path):
     """
     import http.server
 
-    local_port = _free_port()
+    local_port = free_port()
 
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -529,11 +517,6 @@ def test_expose_local_cloudflare_e2e(tmp_path):
                 proc.kill()
     finally:
         srv.shutdown()
-
-
-def _free_port() -> int:
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
-    return p
 
 
 def _wait_for_quick_url(proc: subprocess.Popen, *, timeout: float) -> str | None:

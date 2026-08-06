@@ -373,6 +373,9 @@ def _cf_zone_id(cfg: dict) -> str:
 # named tunnel 跨调用缓存: {(account, tunnel_name): {"tunnel_id","token"}}
 _cf_named_state: dict = {}
 
+# WARP 路由预检缓存: 进程生命周期内路由表基本不变, 缓存 powershell 查询结果 (None=未查)。
+_warp_route_cache: str | None = None
+
 
 def _cf_tunnel_token(cfg: dict, tunnel_id: str) -> str:
     """GET tunnel run token。token 端点返回的 result 可能是 str, 也可能被旧版包成 {result:"..."}。
@@ -1033,45 +1036,27 @@ class SandboxHandle:
             "CLOUDFLARE_TUNNEL_HOSTNAME 走 named tunnel (稳定域名)。")
         return self._cf_quick_tunnel(local_port)
 
-    def _probe_url_ready(self, url: str, *, proc=None, tries: int = 20,
-                         sleep_s: float = 2.0, curl_timeout: int = 8,
-                         extra_curl: str = "", fail_msg: str) -> None:
-        """从沙箱 curl ``url`` 直到拿到非 000 的 HTTP 状态 (隧道通了), 否则抛 RuntimeError。
+    @staticmethod
+    def _http_probe_ok(out: str) -> bool:
+        """沙箱 curl 的 stdout 是否表示"隧道通"。
 
-        chisel / cloudflared quick / cloudflared named 三条隧道启动后都用这套自检, 之前是
-        三份几乎一样的循环。``proc`` 给了会在每轮先查进程是否已死 (死则带 stderr 尾抛错)。
-        ``extra_curl`` 可追加 `-X POST -d '{}'` 等 (chisel 用)。
+        拿到任何非 000、非 530 的 HTTP 状态都算通: 000 = curl 连不上 (隧道没通/DNS 没解析);
+        530 = Cloudflare 边缘到 cloudflared 断 (tunnel_error)。但 404/401/501/502 等说明请求
+        到了适配器 (隧道是通的) —— 真实适配器 GET / 往往 404, 501 也只是方法不支持。
+        (之前 _probe_url_ready 只排除了 000, 会把 530 当成功 —— named/chisel 自检过 530 的假阳性。)
         """
-        import time as _t
-        curl = (
-            f"curl -sS -m {curl_timeout} -o /dev/null -w 'HTTP%{{http_code}}' "
-            f"{url}/ {extra_curl} 2>/dev/null || true"
-        )
-        for _ in range(tries):
-            if proc is not None and proc.poll() is not None:
-                err = (proc.stderr.read().decode(errors="replace")
-                       if proc.stderr else "") if proc is not None else ""
-                raise RuntimeError(f"{fail_msg}: 进程已退出 (rc={proc.returncode}); stderr: {err[:300]}")
-            r = self.run(curl, timeout=curl_timeout + 12)
-            out = (r.get("stdout", "") if r else "")
-            if "HTTP" in out and "HTTP000" not in out:
-                return
-            _t.sleep(sleep_s)
-        if proc is not None:
-            proc.terminate()
-        raise RuntimeError(fail_msg)
+        return "HTTP" in out and "HTTP000" not in out and "HTTP530" not in out
 
-    def _probe_url_sustained(self, url: str, *, proc=None, need: int = 3,
-                             interval_s: float = 3.0, curl_timeout: int = 8,
-                             extra_curl: str = "", deadline_s: int = 40,
-                             fail_msg: str) -> None:
-        """严格自检: 在 deadline_s 内, 连续 ``need`` 次探针都拿到 2xx/3xx (非 000、非 5xx)
-        才算隧道"持续可用", 否则抛 RuntimeError。
+    def _probe_url(self, url: str, *, proc=None, need: int = 1,
+                   interval_s: float = 2.0, curl_timeout: int = 8,
+                   extra_curl: str = "", deadline_s: int = 40,
+                   fail_msg: str) -> None:
+        """从沙箱 curl ``url`` 直到隧道可用, 否则抛 RuntimeError。
 
-        issue #6: trycloudflare quick tunnel 的 edge→origin 连接在真实负载 (claude keep-alive
-        + 大 body) 下会断, 但单次短 curl 能蹭到一个连通窗口骗过 _probe_url_ready → 返回 URL
-        后几秒就 530/1033。本方法要求连续多次都通, flaky 隧道会在 expose_local_cloudflare
-        阶段更快暴露 (仍非根治, trycloudflare 本质不可靠)。5xx (含 530 tunnel_error) 算失败。
+        ``need=1`` = 一次成功即过 (one-shot, named/chisel 用); ``need>1`` = 要求在 deadline_s
+        内连续 ``need`` 次都通 (sustained, quick tunnel 用 —— issue #6: 单次 curl 能蹭连通窗口,
+        要求连续多次才暴露 flaky)。``proc`` 给了会在每轮先查进程是否已死 (死则带 stderr 尾抛错)。
+        ``extra_curl`` 可追加 `-X POST -d '{}'` 等 (chisel 用)。成功判定统一走 _http_probe_ok。
         """
         import time as _t
         curl = (
@@ -1083,16 +1068,12 @@ class SandboxHandle:
         last_out = ""
         while _t.time() < deadline:
             if proc is not None and proc.poll() is not None:
-                err = (proc.stderr.read().decode(errors="replace")
-                       if proc.stderr else "") if proc is not None else ""
+                err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
                 raise RuntimeError(f"{fail_msg}: 进程已退出 (rc={proc.returncode}); stderr: {err[:300]}")
             r = self.run(curl, timeout=curl_timeout + 12)
             out = (r.get("stdout", "") if r else "")
             last_out = out
-            # 隧道通 = 拿到任何非 000、非 530 的 HTTP 响应。000 = curl 连不上 (隧道没通/DNS 没解析);
-            # 530 = Cloudflare 边缘到 cloudflared 断 (tunnel_error)。但 404/401/501/502 等说明
-            # 请求到了适配器 (隧道是通的) —— 真实适配器 GET / 往往 404, 501 也只是方法不支持。
-            if "HTTP" in out and "HTTP000" not in out and "HTTP530" not in out:
+            if self._http_probe_ok(out):
                 streak += 1
                 if streak >= need:
                     return
@@ -1101,10 +1082,23 @@ class SandboxHandle:
             _t.sleep(interval_s)
         if proc is not None:
             proc.terminate()
-        raise RuntimeError(
-            f"{fail_msg}: 在 {deadline_s}s 内未连续 {need} 次探到非 000/非 5xx 响应 "
-            f"(最后一次: {last_out[:60]!r})。trycloudflare quick tunnel 的边缘连接不稳, "
-            f"真实 agent 负载下会 530; 建议设 CLOUDFLARE_API_TOKEN 等走 named tunnel。")
+        if need > 1:
+            raise RuntimeError(
+                f"{fail_msg}: 在 {deadline_s}s 内未连续 {need} 次探到非 000/非 530 响应 "
+                f"(最后一次: {last_out[:60]!r})。trycloudflare quick tunnel 的边缘连接不稳, "
+                f"真实 agent 负载下会 530; 建议设 CLOUDFLARE_API_TOKEN 等走 named tunnel。")
+        raise RuntimeError(fail_msg)
+
+    # 旧名保留为薄包装, 兼容已有调用/测试。
+    def _probe_url_ready(self, url: str, **kw) -> None:
+        """one-shot 自检 (need=1)。新代码直接用 _probe_url(need=1)。"""
+        kw.setdefault("need", 1)
+        self._probe_url(url, **kw)
+
+    def _probe_url_sustained(self, url: str, *, need: int = 3, **kw) -> None:
+        """sustained 自检 (need>1, 默认 3)。新代码直接用 _probe_url(need=3)。"""
+        self._probe_url(url, need=need, **kw)
+
 
     @staticmethod
     def _wait_ha_connections(metrics_url: str, *, deadline_s: int = 30,
@@ -1138,6 +1132,14 @@ class SandboxHandle:
             f"last metrics: {last[:200]!r}")
 
     @staticmethod
+    def _warp_remediation_hint() -> str:
+        """WARP/VPN 抢边缘路由的统一修复建议 (预检 + 失败诊断共用, 避免两处文案漂移)。"""
+        return (
+            "cloudflared 出站连 Cloudflare 边缘会走该虚拟网卡并与之抢路由, 导致隧道 530/连不上。"
+            "请先关掉 WARP/VPN, 或在 WARP 的 Split Tunnel 设置里排除 Cloudflare 边缘 IP, "
+            "或在 cloudflared 命令加 --protocol http2 走 TCP 443 回退, 再重试。")
+
+    @staticmethod
     def _cf_edge_diag(stderr_text: str) -> str:
         """扫 cloudflared stderr, 若发现"连不上边缘"的错误, 返回针对性诊断提示。
 
@@ -1147,49 +1149,73 @@ class SandboxHandle:
         以为是代码 bug。无匹配返回空串。
         """
         t = stderr_text or ""
+        symptom = ""
         if "Failed to dial" in t or "no recent network activity" in t:
-            return (
-                "  [诊断] cloudflared 拨不上 Cloudflare 边缘 (QUIC/UDP 7844)。"
-                "常见原因: 本机的 Cloudflare WARP 或 VPN 路由了 198.18.0.0/16, 跟 "
-                "cloudflared 抢边缘路由。试: 关掉 WARP/VPN, 或在 cloudflared 命令加 "
-                "--protocol http2 走 TCP 443 回退。")
-        if "TLS handshake with edge" in t:
-            return (
-                "  [诊断] cloudflared 到边缘的 TLS 握手失败 (EOF)。常见原因同上 "
-                "(WARP/VPN 劫持 198.18.0.0/16, 或出站 443/7844 被防火墙挡)。"
-                "试: 关 WARP/VPN, 或加 --protocol http2, 或放行出站 443 + UDP 7844。")
-        return ""
+            symptom = "cloudflared 拨不上 Cloudflare 边缘 (QUIC/UDP 7844)"
+        elif "TLS handshake with edge" in t:
+            symptom = "cloudflared 到边缘的 TLS 握手失败 (EOF, 也可能出站 443/7844 被防火墙挡)"
+        if not symptom:
+            return ""
+        return "  [诊断] " + symptom + "。常见原因: 本机的 Cloudflare WARP 或 VPN 路由了 " \
+               f"198.18.0.0/16, 跟 cloudflared 抢边缘路由。{SandboxHandle._warp_remediation_hint()}"
 
     @staticmethod
     def _warn_if_warp_routes() -> None:
         """启动 cloudflared 前预检: 本机是否把 198.18.0.0/16 (Cloudflare WARP 虚拟段)
-        路由到了某个网卡。若是, 提前 warning —— cloudflared 出站连 Cloudflare 边缘会走
-        该虚拟网卡, 跟 WARP 抢路由, 导致 QUIC 拨号失败、公网 URL 530/000。
+        路由到了某个网卡。若是, 提前 warning (见 _warp_remediation_hint)。
 
         代码层面 cloudflared 不支持选源网卡, 所以无法强制绕开 (那是 OS 路由层的事);
-        只能提前检测 + 引导用户关掉 WARP/VPN 或在 Cloudflare WARP 设置里 split-tunnel 排除
-        cloudflared 的边缘 IP。非 Windows / 查不到路由表则静默跳过。
+        只能提前检测 + 引导。非 Windows / 查不到路由表则静默跳过。路由表进程生命周期内
+        基本不变, 结果缓存到模块级 _warp_route_cache 避免每次 expose 都 spawn powershell。
         """
-        import sys as _sys
-        if not _sys.platform.startswith("win"):
-            return  # 跨平台路由检测各自不同, 这里只覆盖最常见的 Windows + WARP 场景
-        import subprocess as _sp
-        try:
-            r = _sp.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-NetRoute -DestinationPrefix '198.18.0.0/16' -ErrorAction SilentlyContinue | "
-                 "Select-Object -ExpandProperty InterfaceAlias -Unique"],
-                capture_output=True, timeout=5, check=False,
-            )
-            out = r.stdout.decode(errors="replace").strip()
-        except (OSError, _sp.SubprocessError):
-            return  # 没装 powershell / 沙箱环境: 跳过
-        if out:
+        global _warp_route_cache
+        if _warp_route_cache is not None:
+            iface = _warp_route_cache
+        else:
+            import sys as _sys
+            if not _sys.platform.startswith("win"):
+                _warp_route_cache = ""  # 非 Windows: 不查, 永久跳过
+                return
+            import subprocess as _sp
+            try:
+                r = _sp.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-NetRoute -DestinationPrefix '198.18.0.0/16' -ErrorAction SilentlyContinue | "
+                     "Select-Object -ExpandProperty InterfaceAlias -Unique"],
+                    capture_output=True, timeout=5, check=False,
+                )
+                iface = r.stdout.decode(errors="replace").strip()
+            except (OSError, _sp.SubprocessError):
+                iface = ""  # 没装 powershell / 沙箱环境
+            _warp_route_cache = iface
+        if iface:
             logger.warning(
-                f"expose_local_cloudflare: 检测到 198.18.0.0/16 路由走网卡 [{out.splitlines()[0]}] —— "
-                f"这通常是本机的 Cloudflare WARP 或 VPN 虚拟网卡。cloudflared 出站连 Cloudflare 边缘 "
-                f"会走该网卡并与之抢路由, 导致隧道 530/连不上。请先关掉 WARP/VPN, 或在 WARP 的 "
-                f"Split Tunnel 设置里排除 Cloudflare 边缘 IP, 再重试。")
+                f"expose_local_cloudflare: 检测到 198.18.0.0/16 路由走网卡 [{iface.splitlines()[0]}] —— "
+                f"这通常是本机的 Cloudflare WARP 或 VPN 虚拟网卡。"
+                f"{SandboxHandle._warp_remediation_hint()}")
+
+    @staticmethod
+    def _cf_alloc_metrics() -> tuple[int, str]:
+        """选一个本地空闲端口给 cloudflared --metrics, 返回 (port, metrics_url)。
+
+        named/quick 两条隧道都要这套, 抽出来避免 bind+close+url 三行重复 (且 TOCTOU 一处维护)。
+        """
+        import socket as _sock
+        s = _sock.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        return port, f"http://127.0.0.1:{port}/metrics"
+
+    def _cf_probe_with_diag(self, probe_fn, _tail, **probe_kw) -> None:
+        """跑 URL 自检; 失败时把 _cf_edge_diag 的诊断追加到异常消息里重抛 (无诊断则原样重抛)。
+
+        named/quick 都用这个包装, 避免 try/except/diag/raise 五行样板在两处重复。
+        """
+        try:
+            probe_fn(**probe_kw)
+        except RuntimeError as _e:
+            diag = self._cf_edge_diag(_tail.text())
+            if diag:
+                raise RuntimeError(f"{_e}\n{diag}") from None
+            raise
 
     def _cf_named_tunnel(self, local_port: int, cfg: dict) -> "PortForward":
         """named tunnel: API token 建隧道 + 绑定自定义域名, URL 稳定。见 expose_local_cloudflare。"""
@@ -1207,10 +1233,7 @@ class SandboxHandle:
         _cf_ensure_dns_cname(cfg, tunnel_id)
 
         # 4. 本地常驻 cloudflared, 拨隧道; --metrics 查 ha_connections; StderrTail 防 pipe 堵
-        import socket as _sock
-        msock = _sock.socket(); msock.bind(("127.0.0.1", 0)); metrics_port = msock.getsockname()[1]
-        msock.close()
-        metrics_url = f"http://127.0.0.1:{metrics_port}/metrics"
+        metrics_port, metrics_url = self._cf_alloc_metrics()
         proc = _sp.Popen(
             [str(cflared), "tunnel", "--metrics", f"127.0.0.1:{metrics_port}",
              "run", "--token", run_token],
@@ -1222,20 +1245,13 @@ class SandboxHandle:
         # 根本自检: 等 cloudflared 向边缘注册 HA 连接 (ha_connections≥1), 再做 URL 自检。
         # 与 quick tunnel 同理 (issue #6): 避免 URL 自检蹭假窗口返回死 URL。
         self._wait_ha_connections(metrics_url, deadline_s=30)
-        import time as _t; _t.sleep(1)
 
-        # 兜底: 沙箱 curl 公网 URL (DNS 传播 + 边缘生效要几秒)
-        try:
-            self._probe_url_ready(
-                public_url, proc=proc,
-                fail_msg=f"cloudflared named tunnel {public_url} 在 40s 内未被沙箱访问通; DNS/边缘可能还在传播。"
-                f" stderr: {_tail.text()[:300]}",
-            )
-        except RuntimeError as _e:
-            diag = self._cf_edge_diag(_tail.text())
-            if diag:
-                raise RuntimeError(f"{_e}\n{diag}") from None
-            raise
+        # 兜底: 沙箱 curl 公网 URL (DNS 传播 + 边缘生效要几秒); 失败追加边缘诊断。
+        self._cf_probe_with_diag(
+            self._probe_url_ready, _tail, url=public_url, proc=proc,
+            fail_msg=f"cloudflared named tunnel {public_url} 在 40s 内未被沙箱访问通; DNS/边缘可能还在传播。"
+            f" stderr: {_tail.text()[:300]}",
+        )
 
         from managed_e2b.models import PortForward
         return PortForward(
@@ -1244,15 +1260,12 @@ class SandboxHandle:
 
     def _cf_quick_tunnel(self, local_port: int) -> "PortForward":
         """quick tunnel: 无 key, 随机 trycloudflare URL。见 expose_local_cloudflare。"""
-        import socket as _sock
         import subprocess as _sp
+        import threading as _th
 
         cflared = ensure_local_cloudflared()
         self._warn_if_warp_routes()  # 预检: WARP/VPN 路由 198.18.0.0/16 会抢边缘路由
-        # 选一个本地空闲端口给 cloudflared 的 --metrics (查 ha_connections 用, issue #6 根本修法)
-        msock = _sock.socket(); msock.bind(("127.0.0.1", 0)); metrics_port = msock.getsockname()[1]
-        msock.close()
-        metrics_url = f"http://127.0.0.1:{metrics_port}/metrics"
+        metrics_port, metrics_url = self._cf_alloc_metrics()
         proc = _sp.Popen(
             [str(cflared), "tunnel", "--metrics", f"127.0.0.1:{metrics_port}",
              "--url", f"http://localhost:{local_port}"],
@@ -1260,7 +1273,6 @@ class SandboxHandle:
         )
         # 边读 stderr 边按行抓 trycloudflare URL; StderrTail 有界 deque + 行回调, 不钉外层作用域,
         # 也不 O(n²) 重扫全量。URL 抓到用 Event 通知。
-        import threading as _th
         found = _th.Event()
         holder: dict[str, str | None] = {"url": None}
         def _on_line(line):
@@ -1270,10 +1282,18 @@ class SandboxHandle:
                     holder["url"] = u
                     found.set()
         _tail = StderrTail(proc.stderr, on_line=_on_line)
-        # 等 cloudflared 拿到 trycloudflare URL **且** 向边缘注册了 HA 连接 (ha_connections≥1)。
-        # URL 抓到不代表隧道可用 —— issue #6: 530/1033 是 cloudflared→边缘连接没建好,
-        # 必须等 ha_connections≥1 才算真的通了。两者并行等, 都满足才继续。
-        import time as _t
+
+        # cloudflared 拿 trycloudflare URL 与向边缘注册 HA 连接是并行发生的, 这里也并行等:
+        # HA gate 放后台线程, URL 在主线程等, 都完成 (或任一失败) 才继续。比串行两个 30s 省一半。
+        ha_err: list[Exception] = []
+        def _ha_wait():
+            try:
+                self._wait_ha_connections(metrics_url, deadline_s=30)
+            except RuntimeError as e:
+                ha_err.append(e)
+        ha_thread = _th.Thread(target=_ha_wait, daemon=True)
+        ha_thread.start()
+
         url_ok = found.wait(timeout=30)
         if not url_ok and proc.poll() is not None:
             raise RuntimeError(
@@ -1285,22 +1305,17 @@ class SandboxHandle:
         if proc.poll() is not None:
             raise RuntimeError(
                 f"cloudflared quick tunnel 退出 (rc={proc.returncode})。stderr: {_tail.text()[:400]}")
-        # 根本自检: 等 ha_connections≥1 (cloudflared 真连上边缘), 再做 URL 持续探针。
-        # 这一步把"蹭假窗口返回死 URL"的假阳性从根上消掉 (issue #6 的治本, sustained 是治标)。
-        self._wait_ha_connections(metrics_url, deadline_s=30)
-        _t.sleep(1)  # 边缘把新连接加入路由表也要一两秒
+        ha_thread.join(timeout=30)  # 等 HA gate 完成 (URL 通常先到, HA 还要几秒)
+        if ha_err:
+            proc.terminate()
+            raise ha_err[0]
 
-        # 再做一次持续 URL 自检作为兜底 (ha_connections≥1 后仍可能短暂 530, 多探几下)。
-        try:
-            self._probe_url_sustained(
-                public_url, proc=proc, need=3, interval_s=3.0, curl_timeout=8, deadline_s=40,
-                fail_msg=f"cloudflared quick tunnel {public_url} 自检失败",
-            )
-        except RuntimeError as _e:
-            diag = self._cf_edge_diag(_tail.text())
-            if diag:
-                raise RuntimeError(f"{_e}\n{diag}") from None
-            raise
+        # 持续 URL 自检 (need=3): ha_connections≥1 后仍可能短暂 530, 要求连续 3 次通才放行;
+        # 失败追加边缘诊断。这是 issue #6 的兜底 (治本), sustained 探针本身是治标。
+        self._cf_probe_with_diag(
+            self._probe_url_sustained, _tail, url=public_url, proc=proc,
+            need=3, fail_msg=f"cloudflared quick tunnel {public_url} 自检失败",
+        )
 
         from managed_e2b.models import PortForward
         host = public_url[len("https://"):] if public_url.startswith("https://") else public_url

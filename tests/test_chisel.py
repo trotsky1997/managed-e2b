@@ -24,6 +24,9 @@ import pytest
 
 from managed_e2b.core import ensure_local_chisel
 
+# shared test helper from tests/conftest.py
+from conftest import free_port  # type: ignore  # noqa: E402
+
 _CHISEL_BIN = Path.home() / ".cache" / "managed_e2b" / "chisel" / (
     "chisel.exe" if sys.platform.startswith("win") else "chisel"
 )
@@ -45,8 +48,7 @@ skip_no_chisel = pytest.mark.skipif(
 
 
 def _free_port() -> int:
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
-    return p
+    return free_port()
 
 
 def _start_echo_http(port: int) -> threading.Thread:
