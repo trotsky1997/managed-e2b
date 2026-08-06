@@ -710,11 +710,15 @@ class SandboxHandle:
         POST body 读到一半时拆桥 → ``Connection lost``; chisel 无此问题)。
 
         - 沙箱内: 下载 linux chisel server (Linux 不被杀软拦), 跑
-          ``chisel server --reverse --port <chisel_port> --auth e2b:<token>``;
+          ``chisel server --reverse --port <chisel_port> --auth e2b:<token> --keepalive 10s``;
           暴露 chisel_port (E2B 网关 TLS 终结 → 本地拨 wss://)。
         - 本地: ensure_local_chisel() 拿到本地 chisel client (下载到
           ~/.cache/managed_e2b/chisel/), 跑
-          ``chisel client --auth e2b:<token> wss://<host> R:127.0.0.1:<sandbox_port>:127.0.0.1:<local_port>``。
+          ``chisel client --auth e2b:<token> --max-retry-interval 5s --keepalive 10s
+          wss://<host> R:127.0.0.1:<sandbox_port>:127.0.0.1:<local_port>``。
+          (调优: ``--max-retry-interval 5s`` —— 默认 5 分钟, 网络抖断后恢复太慢;
+          ``--keepalive 10s`` —— 防 E2B 网关/NAT 切 idle 长连接。client 日志写到
+          ~/.cache/managed_e2b/chisel/client.log, 不用 PIPE 避免长跑堵 pipe。)
 
         **Windows 上 chisel.exe 可能被杀软误报隔离** (Go 反向隧道二进制高误报)。
         ensure_local_chisel() 下载后会立刻 smoke-test ``--version``; 被拦时抛带加白
@@ -832,7 +836,7 @@ class SandboxHandle:
         )
         self.run(
             f'nohup "$HOME/bin/chisel" server --reverse --port {chisel_port} '
-            f"--auth e2b:{token} > /tmp/chisel_server.log 2>&1 & echo PID=$!",
+            f"--auth e2b:{token} --keepalive 10s > /tmp/chisel_server.log 2>&1 & echo PID=$!",
             timeout=5,
         )
         import time as _t; _t.sleep(2)
@@ -851,24 +855,37 @@ class SandboxHandle:
 
         # 4. 本地后台启动 chisel client, 建 R: 反向隧道
         #    R:<sandbox 侧监听 iface>:<sandbox 侧监听 port>:<本地目标 host>:<本地目标 port>
+        #    调优 (实测): --max-retry-interval 5s (默认 5 分钟, 网络抖断后恢复太慢) +
+        #    --keepalive 10s (防 E2B 网关/NAT 切 idle 长连接; chisel 默认也是 10s, 显式设保一致)。
+        #    stdout/stderr 重定向到日志文件而非 PIPE —— PIPE 不 drain 会在 ~64KB 堵住,
+        #    长跑的 chisel client 会被自己日志卡死。
+        import pathlib as _pl
+        client_log = _pl.Path.home() / ".cache" / "managed_e2b" / "chisel" / "client.log"
+        client_log.parent.mkdir(parents=True, exist_ok=True)
         client_cmd = [
             str(local_chisel), "client",
             "--auth", f"e2b:{token}",
+            "--max-retry-interval", "5s",
+            "--keepalive", "10s",
             server_url,
             f"R:127.0.0.1:{sandbox_port}:127.0.0.1:{local_port}",
         ]
+        client_log_fp = open(client_log, "ab", buffering=0)
         client_proc = _sp.Popen(
             client_cmd, stdin=_sp.DEVNULL,
-            stdout=_sp.PIPE, stderr=_sp.PIPE,
+            stdout=client_log_fp, stderr=_sp.STDOUT,
         )
         import time as _t2; _t2.sleep(3)
         if client_proc.poll() is not None:
-            err = client_proc.stderr.read().decode(errors="replace")
+            try:
+                err = client_log.read_bytes().decode(errors="replace")
+            except OSError:
+                err = ""
             if "not recognized" in err or "Access is denied" in err or not err:
                 raise RuntimeError(
                     f"chisel client 启动失败 (rc={client_proc.returncode})。"
                     f"很可能是杀软隔离了 {local_chisel}。请把它加入杀软白名单后重试。"
-                    f"stderr: {err[:300]}"
+                    f"log: {client_log} stderr: {err[:300]}"
                 )
             raise RuntimeError(f"chisel client failed to start: {err[:300]}")
 
