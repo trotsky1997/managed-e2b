@@ -1,6 +1,6 @@
 """验证三种并发数独立: build / create / run 互不挤占"""
 import os, time, threading, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 from managed_e2b import SandboxLifecycle, State
 

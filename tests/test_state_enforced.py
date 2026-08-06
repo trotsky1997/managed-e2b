@@ -1,6 +1,6 @@
 """验证状态机强制: 所有写 state 的路径都受 transition_to 约束, 跳跃被拒"""
 import os
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 from managed_e2b import SandboxLifecycle, State
 
 passed, failed = [], []

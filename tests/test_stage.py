@@ -1,6 +1,6 @@
 """测试 stage_in + run_script + stage_out 端到端"""
 import os
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 from managed_e2b import SandboxLifecycle
 
 passed, failed = [], []
@@ -9,7 +9,7 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name} {detail}")
 
 lc = SandboxLifecycle(db_path="/root/sb_stage.db", max_concurrent=2,
-                      e2b_key="***REMOVED***")
+                      e2b_key=os.environ["E2B_API_KEY"])
 
 with lc.acquire(template="base", timeout=180) as h:
     # stage in: 推一个计算脚本 + 数据

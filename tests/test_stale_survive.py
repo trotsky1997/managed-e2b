@@ -1,6 +1,6 @@
 """R3-3: acquire 持有超过 stale_timeout 时 reap 不误杀(心跳持续刷新)"""
 import os, time, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle
 

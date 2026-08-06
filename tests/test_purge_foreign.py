@@ -1,6 +1,6 @@
 """#2 修复验证: purge_foreign=True 真正 kill 外部沙箱(不在 DB)"""
 import os, time, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle
 from e2b_code_interpreter import Sandbox

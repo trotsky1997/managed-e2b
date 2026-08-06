@@ -14,7 +14,7 @@ from managed_e2b import SandboxLifecycle
 lc = SandboxLifecycle(
     db_path="/root/sb_endpoint.db",
     max_concurrent=2,
-    e2b_key="***REMOVED***",  # E2B 官方
+    e2b_key=os.environ["E2B_API_KEY"],  # E2B 官方
 )
 # 沙箱能 create = key 下沉 env 生效
 with lc.acquire(template="base", timeout=60, metadata={"track": "endpoint-test"}) as h:
@@ -24,7 +24,7 @@ with lc.acquire(template="base", timeout=60, metadata={"track": "endpoint-test"}
 check("退出后 cleaned", lc.db.get(h.sid)["state"] == "cleaned")
 
 print("[2] 环境变量确实被写入")
-check("E2B_API_KEY env 已写入", os.environ.get("E2B_API_KEY") == "***REMOVED***")
+check("E2B_API_KEY env 已写入", os.environ.get("E2B_API_KEY") == os.environ["E2B_API_KEY"])
 
 print(f"\n=== {len(passed)} passed, {len(failed)} failed ===")
 if failed: print("FAILED:", failed)

@@ -1,6 +1,6 @@
 """沙箱生命周期管理器 —— 关键场景测试"""
 import os, time, threading, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle, State
 

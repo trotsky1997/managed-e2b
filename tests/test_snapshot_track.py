@@ -1,6 +1,6 @@
 """验证 save 追踪快照 + cleanup_snapshots 清理"""
 import os
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 from managed_e2b import SandboxLifecycle
 
 passed, failed = [], []
@@ -9,7 +9,7 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name} {detail}")
 
 lc = SandboxLifecycle(db_path="/root/sb_snaptrack.db", max_concurrent=2,
-                      e2b_key="***REMOVED***")
+                      e2b_key=os.environ["E2B_API_KEY"])
 
 snap_ids = []
 with lc.acquire(template="base", timeout=300) as h:

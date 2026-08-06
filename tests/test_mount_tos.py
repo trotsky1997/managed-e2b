@@ -11,7 +11,7 @@ def check(name, cond, detail=""):
     print(f"  {'✓' if cond else '✗'} {name} {detail}")
 
 lc = SandboxLifecycle(db_path="/root/sb_mount.db", max_concurrent=1,
-                      e2b_key="***REMOVED***")
+                      e2b_key=os.environ["E2B_API_KEY"])
 with lc.acquire(template="base", timeout=600) as h:
     print("挂载 TOS 桶 (装 s3fs 可能慢)...")
     h.mount_tos("tos-mindverse")

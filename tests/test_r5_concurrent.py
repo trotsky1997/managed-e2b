@@ -3,7 +3,7 @@ R3-1 教训: 上版用 time.sleep(0.5) 发 reconcile, 但首行 ~1.3s 才出现 
 本版用事件同步: 等 RUNNING 行存在且心跳新, 再发 reconcile。
 """
 import os, time, threading, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle, State
 from e2b_code_interpreter import Sandbox

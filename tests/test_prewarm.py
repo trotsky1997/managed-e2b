@@ -1,6 +1,6 @@
 """prewarm 去重测试: 同输入不重复 build"""
 import os, time, threading, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 from managed_e2b import SandboxLifecycle
 

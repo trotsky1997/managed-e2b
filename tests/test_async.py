@@ -1,6 +1,6 @@
 """async 核心测试: acquire + stage in/out + run_script + 并发"""
 import os, asyncio
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 from managed_e2b import AsyncSandboxLifecycle
 
 passed, failed = [], []
@@ -10,7 +10,7 @@ def check(name, cond, detail=""):
 
 async def main():
     lc = AsyncSandboxLifecycle(db_path="/root/sb_async.db", max_concurrent=2,
-                               e2b_key="***REMOVED***")
+                               e2b_key=os.environ["E2B_API_KEY"])
 
     print("[1] async acquire + stage in/out + run_script")
     async with lc.acquire(template="base", timeout=180) as h:

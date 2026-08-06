@@ -5,7 +5,7 @@
   - 同 READY 再来 → 期望 0 次
 """
 import os, time, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 from managed_e2b import SandboxLifecycle

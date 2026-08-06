@@ -1,6 +1,6 @@
 """#4 修复验证: 小 stale_timeout 下活跃沙箱不被 reap 误杀"""
 import os, time, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle
 

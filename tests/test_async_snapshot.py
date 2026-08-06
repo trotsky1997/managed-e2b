@@ -1,6 +1,6 @@
 """async 版 save/fork/pause/resume/restore_from_snapshot 测试"""
 import os, asyncio
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 from managed_e2b import AsyncSandboxLifecycle
 
 passed, failed = [], []
@@ -10,7 +10,7 @@ def check(name, cond, detail=""):
 
 async def main():
     lc = AsyncSandboxLifecycle(db_path="/root/sb_async_snap.db", max_concurrent=2,
-                               e2b_key="***REMOVED***")
+                               e2b_key=os.environ["E2B_API_KEY"])
 
     print("[1] save + restore_from_snapshot")
     async with lc.acquire(template="base", timeout=300) as h:

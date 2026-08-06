@@ -1,6 +1,6 @@
 """R4: 10-thread concurrent acquire stress + reap-during-acquire + pagination check"""
 import os, time, threading, logging, traceback
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 from managed_e2b import SandboxLifecycle, State
 

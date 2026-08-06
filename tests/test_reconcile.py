@@ -1,6 +1,6 @@
 """#5 reconcile 测试: sqlite 有 RUNNING 残留但 E2B 无对应 → 标 CLEANED"""
 import os, logging
-os.environ["E2B_API_KEY"] = "***REMOVED***"
+os.environ.setdefault("E2B_API_KEY", os.environ.get("E2B_API_KEY") or "")
 logging.basicConfig(level=logging.WARNING)
 from managed_e2b import SandboxLifecycle, State
 

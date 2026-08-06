@@ -4,7 +4,10 @@ __pycache__/
 build/
 dist/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.log
 .eggs/
 .tox/
 .pytest_cache/
