@@ -1133,9 +1133,12 @@ class SandboxHandle:
         token = chisel_token or _sec.token_hex(16)
 
         # 1. 沙箱内下载 + 启动 chisel server (--reverse 允许客户端提反向隧道)
+        # NOTE: E2B's base template runs as `user` (uid 1000), NOT root, so
+        # /root is 0700 root-owned and unreachable. Install chisel under the
+        # login user's $HOME/bin (resolves to /home/user/bin) instead.
         self.run(
             "set -e; "
-            "mkdir -p /root/bin && cd /root/bin; "
+            "mkdir -p \"$HOME/bin\" && cd \"$HOME/bin\"; "
             "if ! [ -x ./chisel ]; then "
             "  curl -sL https://github.com/jpillora/chisel/releases/download/"
             f"v{_CHISEL_VERSION}/chisel_{_CHISEL_VERSION}_linux_amd64.gz -o chisel.gz && "
@@ -1144,7 +1147,7 @@ class SandboxHandle:
             timeout=60,
         )
         self.run(
-            f"nohup /root/bin/chisel server --reverse --port {chisel_port} "
+            f'nohup "$HOME/bin/chisel" server --reverse --port {chisel_port} '
             f"--auth e2b:{token} > /tmp/chisel_server.log 2>&1 & echo PID=$!",
             timeout=5,
         )
@@ -1153,7 +1156,11 @@ class SandboxHandle:
         # 2. 暴露 chisel_port (E2B 网关 TLS 终结 → 本地拨 wss://)
         self.expose_port(chisel_port)
         chisel_host = self.get_host(chisel_port)
-        server_url = f"wss://{chisel_host}"
+        # chisel's URL parser mangles a bare ``wss://host`` (it pre-prepends
+        # ws:// and eats the scheme, dialing ``wss::80``). ``https://host`` parses
+        # correctly — chisel upgrades it to wss on :443 (the E2B gateway's TLS
+        # listener). Verified against chisel 1.11.8.
+        server_url = f"https://{chisel_host}"
 
         # 3. 本地确保有 chisel client (下载到缓存; 杀软拦截会在这抛带引导的错)
         local_chisel = ensure_local_chisel()
