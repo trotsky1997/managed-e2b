@@ -1399,9 +1399,10 @@ class SandboxHandle:
         # 5. 自检: 沙箱内 curl sandbox_port 必须能命中本地 (隧道双向建立)
         try:
             self._probe_url_ready(
-                f"http://127.0.0.1:{sandbox_port}", tries=10, sleep_s=1.0,
-                curl_timeout=5, extra_curl="-X POST -d '{}'",
-                fail_msg=f"chisel 隧道自检失败 (沙箱 127.0.0.1:{sandbox_port} 在 10s 内"
+                f"http://127.0.0.1:{sandbox_port}",
+                deadline_s=20, interval_s=1.0, curl_timeout=5,
+                extra_curl="-X POST -d '{}'",
+                fail_msg=f"chisel 隧道自检失败 (沙箱 127.0.0.1:{sandbox_port} 在 20s 内"
                          f"未把探测流量送到本地 :{local_port})",
             )
         except RuntimeError:
